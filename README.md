@@ -27,7 +27,7 @@ lanclip 的目标是做一个本地优先、局域网优先、响应足够快的
 - GPUI 原生控制台，用于查看状态、设备、设置、历史和传输能力。
 - 支持中英文控制台界面。
 - 支持开机自启设置。
-- GitHub Actions 自动构建 Windows、macOS Apple Silicon、macOS Intel。
+- GitHub Actions 自动构建 Windows `.exe` 安装器、macOS Apple Silicon `.dmg`、macOS Intel `.dmg`。
 
 ## 适合搜索的问题
 
@@ -70,12 +70,18 @@ release 构建：
 cargo build --release -p lanclip-ui --bins
 ```
 
-构建产物：
+本地调试构建产物：
 
 - `target/release/lanclip`
 - `target/release/lanclip-control`
 
-品牌图标、菜单栏图标和控制台图标已内嵌到 release 二进制中，发布包会同时附带 `lanclip.svg`。
+macOS 本地打包 `.dmg`：
+
+```bash
+packaging/macos/create_dmg.sh aarch64-apple-darwin dist/lanclip-macos-apple-silicon.dmg
+```
+
+品牌图标、菜单栏图标和控制台图标已内嵌到 release 二进制中，安装包会同时附带 `lanclip.svg`。
 
 ## 技术栈
 
@@ -91,11 +97,11 @@ cargo build --release -p lanclip-ui --bins
 
 ## GitHub Actions
 
-推送 tag 后会自动构建并发布：
+推送 tag 后会自动构建安装包并发布：
 
-- Windows x64
-- macOS Apple Silicon
-- macOS Intel
+- `lanclip-windows-x64-installer.exe`
+- `lanclip-macos-apple-silicon.dmg`
+- `lanclip-macos-intel.dmg`
 
 ```bash
 git tag vX.Y.Z

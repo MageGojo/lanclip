@@ -3,9 +3,7 @@
 sd_venv/
 **/*.rs.bk
 
-dist/*
-!dist/*.tar.gz
-!dist/*.zip
+dist/
 
 # IDE
 .idea/

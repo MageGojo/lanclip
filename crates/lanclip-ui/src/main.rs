@@ -362,9 +362,14 @@ fn launch_control_panel(endpoint: &ControlEndpoint, child: &mut Option<std::proc
         }
     }
 
+    let helper_name = if cfg!(windows) {
+        "lanclip-control.exe"
+    } else {
+        "lanclip-control"
+    };
     let exe = std::env::current_exe()
         .ok()
-        .and_then(|path| path.parent().map(|dir| dir.join("lanclip-control")));
+        .and_then(|path| path.parent().map(|dir| dir.join(helper_name)));
     let spawned = if let Some(exe) = exe.filter(|path| path.exists()) {
         Command::new(exe)
             .arg("--control")

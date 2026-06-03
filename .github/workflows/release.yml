@@ -23,15 +23,15 @@ jobs:
           - name: windows-x64
             os: windows-latest
             target: x86_64-pc-windows-msvc
-            archive: lanclip-windows-x64.zip
+            asset: lanclip-windows-x64-installer.exe
           - name: macos-apple-silicon
             os: macos-14
             target: aarch64-apple-darwin
-            archive: lanclip-macos-apple-silicon.tar.gz
+            asset: lanclip-macos-apple-silicon.dmg
           - name: macos-intel
             os: macos-15-intel
             target: x86_64-apple-darwin
-            archive: lanclip-macos-intel.tar.gz
+            asset: lanclip-macos-intel.dmg
 
     steps:
       - uses: actions/checkout@v6
@@ -49,37 +49,51 @@ jobs:
       - name: Build release
         run: cargo build --release -p lanclip-ui --bins --target ${{ matrix.target }}
 
-      - name: Package Unix
-        if: runner.os != 'Windows'
+      - name: Package macOS DMG
+        if: runner.os == 'macOS'
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p "dist/lanclip-${{ matrix.name }}"
-          cp "target/${{ matrix.target }}/release/lanclip" "dist/lanclip-${{ matrix.name }}/"
-          cp "target/${{ matrix.target }}/release/lanclip-control" "dist/lanclip-${{ matrix.name }}/"
-          cp README.md "dist/lanclip-${{ matrix.name }}/"
-          cp LICENSE "dist/lanclip-${{ matrix.name }}/"
-          cp crates/lanclip-ui/assets/icons/lanclip.svg "dist/lanclip-${{ matrix.name }}/"
-          chmod +x "dist/lanclip-${{ matrix.name }}/lanclip" "dist/lanclip-${{ matrix.name }}/lanclip-control"
-          tar -C dist -czf "dist/${{ matrix.archive }}" "lanclip-${{ matrix.name }}"
+          chmod +x packaging/macos/create_dmg.sh scripts/make_icons.py
+          packaging/macos/create_dmg.sh "${{ matrix.target }}" "dist/${{ matrix.asset }}"
 
-      - name: Package Windows
+      - name: Install NSIS
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force "dist/lanclip-${{ matrix.name }}" | Out-Null
-          Copy-Item "target/${{ matrix.target }}/release/lanclip.exe" "dist/lanclip-${{ matrix.name }}/"
-          Copy-Item "target/${{ matrix.target }}/release/lanclip-control.exe" "dist/lanclip-${{ matrix.name }}/"
-          Copy-Item "README.md" "dist/lanclip-${{ matrix.name }}/"
-          Copy-Item "LICENSE" "dist/lanclip-${{ matrix.name }}/"
-          Copy-Item "crates/lanclip-ui/assets/icons/lanclip.svg" "dist/lanclip-${{ matrix.name }}/"
-          Compress-Archive -Path "dist/lanclip-${{ matrix.name }}" -DestinationPath "dist/${{ matrix.archive }}" -Force
+          choco install nsis -y --no-progress
+
+      - name: Package Windows installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $version = "${{ github.ref_name }}"
+          if ($version.StartsWith("v")) { $version = $version.Substring(1) }
+          if ($version -eq "main" -or [string]::IsNullOrWhiteSpace($version)) { $version = "0.1.0" }
+          $stage = (Resolve-Path ".").Path + "\dist\stage-${{ matrix.name }}"
+          $icons = (Resolve-Path ".").Path + "\dist\icons"
+          New-Item -ItemType Directory -Force $stage, $icons | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/lanclip.exe" "$stage\"
+          Copy-Item "target/${{ matrix.target }}/release/lanclip-control.exe" "$stage\"
+          Copy-Item "README.md" "$stage\"
+          Copy-Item "LICENSE" "$stage\"
+          Copy-Item "crates/lanclip-ui/assets/icons/lanclip.svg" "$stage\"
+          python scripts/make_icons.py --ico "$stage\lanclip.ico"
+          $makensis = "${env:ProgramFiles(x86)}\NSIS\makensis.exe"
+          if (!(Test-Path $makensis)) { $makensis = "makensis" }
+          & $makensis `
+            "/DAPP_VERSION=$version" `
+            "/DSTAGE_DIR=$stage" `
+            "/DOUTPUT_EXE=$((Resolve-Path ".").Path)\dist\${{ matrix.asset }}" `
+            "/DICON_PATH=$stage\lanclip.ico" `
+            "packaging\windows\lanclip.nsi"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v6
         with:
           name: ${{ matrix.name }}
-          path: dist/${{ matrix.archive }}
+          path: dist/${{ matrix.asset }}
           if-no-files-found: error
 
   release:
@@ -94,6 +108,18 @@ jobs:
           path: dist
           merge-multiple: true
 
+      - name: Delete older releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          gh release list --repo "$GITHUB_REPOSITORY" --limit 100 --json tagName --jq '.[].tagName' \
+            | while read -r tag; do
+                [ -z "$tag" ] && continue
+                [ "$tag" = "$TAG_NAME" ] && continue
+                gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag || true
+              done
+
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -102,4 +128,4 @@ jobs:
           gh release create "$TAG_NAME" dist/* \
             --repo "$GITHUB_REPOSITORY" \
             --title "lanclip $TAG_NAME" \
-            --notes "Automated lanclip release for Windows, macOS Apple Silicon, and macOS Intel."
+            --notes "Automated lanclip installer release for Windows, macOS Apple Silicon, and macOS Intel."
