@@ -100,5 +100,6 @@ jobs:
           TAG_NAME: ${{ github.ref_name }}
         run: |
           gh release create "$TAG_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
             --title "lanclip $TAG_NAME" \
             --notes "Automated lanclip release for Windows, macOS Apple Silicon, and macOS Intel."
