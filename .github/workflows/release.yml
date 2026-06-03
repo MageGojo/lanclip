@@ -96,8 +96,17 @@ jobs:
             "/DICON_PATH=$stage\lanclip.ico" `
             "packaging\windows\lanclip.nsi"
 
+      - name: Verify packaged asset
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          Get-ChildItem -Path "dist" -Recurse | Format-Table FullName, Length
+          if (!(Test-Path "dist/${{ matrix.asset }}")) {
+            throw "Missing packaged asset: dist/${{ matrix.asset }}"
+          }
+
       - name: Upload artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.name }}
           path: dist/${{ matrix.asset }}
