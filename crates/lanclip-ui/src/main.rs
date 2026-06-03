@@ -4,7 +4,7 @@ mod control_api;
 mod tray;
 mod web_panel;
 
-use std::process::Command;
+use std::process::{Child, Command};
 use std::sync::Mutex;
 
 use control_api::{start_control_server, ControlEndpoint};
@@ -158,6 +158,11 @@ fn main() -> anyhow::Result<()> {
                 PanelAction::OpenControl => {
                     panel.hide();
                     launch_control_panel(&control_endpoint, &mut control_child)
+                }
+                PanelAction::Quit => {
+                    panel.hide();
+                    terminate_control_child(&mut control_child);
+                    *cf = ControlFlow::Exit;
                 }
             },
 
@@ -352,15 +357,7 @@ fn relative_time(ts: u64) -> String {
 }
 
 fn launch_control_panel(endpoint: &ControlEndpoint, child: &mut Option<std::process::Child>) {
-    if let Some(existing) = child {
-        match existing.try_wait() {
-            Ok(None) => {
-                focus_process(existing.id());
-                return;
-            }
-            Ok(Some(_)) | Err(_) => *child = None,
-        }
-    }
+    terminate_control_child(child);
 
     let helper_name = if cfg!(windows) {
         "lanclip-control.exe"
@@ -398,6 +395,22 @@ fn launch_control_panel(endpoint: &ControlEndpoint, child: &mut Option<std::proc
             *child = Some(new_child);
         }
         Err(e) => warn!("launch control panel failed: {e}"),
+    }
+}
+
+fn terminate_control_child(child: &mut Option<Child>) {
+    let Some(mut existing) = child.take() else {
+        return;
+    };
+    match existing.try_wait() {
+        Ok(Some(_status)) => {}
+        Ok(None) => {
+            if let Err(e) = existing.kill() {
+                warn!("terminate control panel failed: {e}");
+            }
+            let _ = existing.wait();
+        }
+        Err(e) => warn!("poll control panel failed: {e}"),
     }
 }
 

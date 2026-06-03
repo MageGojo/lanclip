@@ -1431,6 +1431,7 @@ fn main() -> anyhow::Result<()> {
         .with_assets(control_assets())
         .run(move |cx: &mut App| {
             gpui_component::init(cx);
+            cx.on_window_closed(|cx| cx.quit()).detach();
             cx.open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(Bounds::centered(

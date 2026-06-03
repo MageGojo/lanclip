@@ -31,6 +31,7 @@ pub enum PanelAction {
     PreviewVisible(bool),
     PreviewRequest(String),
     OpenControl,
+    Quit,
 }
 
 #[derive(Clone)]
@@ -264,6 +265,7 @@ fn parse_panel_action(body: &str) -> Option<PanelAction> {
         "clear" => Some(PanelAction::Clear),
         "hide" => Some(PanelAction::Hide),
         "open_control" => Some(PanelAction::OpenControl),
+        "quit" => Some(PanelAction::Quit),
         "preview" => v
             .get("visible")
             .and_then(|visible| visible.as_bool())
@@ -456,7 +458,7 @@ fn panel_html() -> String {
     }
     .top {
       display: grid;
-      grid-template-columns: minmax(0, 1fr) 58px 54px;
+      grid-template-columns: minmax(0, 1fr) 34px 54px 28px;
       gap: 6px;
       align-items: center;
       padding: 7px;
@@ -479,6 +481,7 @@ fn panel_html() -> String {
       height: 28px;
       border: 1px solid rgba(255, 255, 255, .76);
       border-radius: 9px;
+      padding: 0 9px;
       background: rgba(255, 255, 255, .66);
       box-shadow: inset 0 1px 0 rgba(255, 255, 255, .74), 0 1px 6px rgba(0, 0, 0, .035);
       color: rgba(16, 20, 24, .90);
@@ -490,11 +493,22 @@ fn panel_html() -> String {
       align-items: center;
       justify-content: center;
       gap: 4px;
-      width: 58px;
+      width: 34px;
       padding: 0;
       font-size: 12px;
       line-height: 1;
       font-weight: 600;
+    }
+    #quit {
+      width: 28px;
+      padding: 0;
+      font-size: 17px;
+      line-height: 1;
+      color: rgba(111, 31, 31, .88);
+    }
+    #quit:hover {
+      background: rgba(255, 236, 236, .82);
+      border-color: rgba(255, 176, 176, .72);
     }
     .settings-icon {
       position: relative;
@@ -676,8 +690,9 @@ fn panel_html() -> String {
     <div class="menu">
       <div class="top">
         <input id="q" autocomplete="off" spellcheck="false" placeholder="Search clipboard history">
-        <button id="control" type="button" aria-label="Open Settings"><span class="settings-icon"></span><span>设置</span></button>
+        <button id="control" type="button" aria-label="Open Settings"><span class="settings-icon"></span></button>
         <button id="clear" type="button">Clear</button>
+        <button id="quit" type="button" aria-label="Quit lanclip">×</button>
       </div>
       <div id="list" class="list"></div>
     </div>
@@ -689,6 +704,7 @@ fn panel_html() -> String {
     const q = document.getElementById('q');
     const clear = document.getElementById('clear');
     const control = document.getElementById('control');
+    const quit = document.getElementById('quit');
     let entries = [];
     let filtered = [];
     let active = 0;
@@ -856,6 +872,7 @@ fn panel_html() -> String {
     });
     clear.addEventListener('click', () => post({ type: 'clear' }));
     control.addEventListener('click', () => post({ type: 'open_control' }));
+    quit.addEventListener('click', () => post({ type: 'quit' }));
     bubble.addEventListener('mouseenter', () => {
       clearPendingHide();
       hovering = true;
