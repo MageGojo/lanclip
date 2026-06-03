@@ -1,0 +1,25 @@
+[package]
+name = "lanclip-clipboard"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+lanclip-domain = { workspace = true }
+tokio = { workspace = true }
+bytes = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+
+# 非 macOS：仍使用 clipboard-rs
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+clipboard-rs = { workspace = true }
+
+# macOS：直接调用 NSPasteboard（Maccy 同款方式）
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { workspace = true }
+objc2-app-kit = { workspace = true }
+objc2-foundation = { workspace = true }
+image = { workspace = true, features = ["tiff"] }

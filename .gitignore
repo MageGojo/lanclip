@@ -1,0 +1,22 @@
+# Rust
+/target/
+sd_venv/
+**/*.rs.bk
+
+dist/*
+!dist/*.tar.gz
+!dist/*.zip
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# macOS
+.DS_Store
+
+# 应用产生
+*.lanclip.part
+*.log
+/data/

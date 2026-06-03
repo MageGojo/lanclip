@@ -1,0 +1,87 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/lanclip-domain",
+    "crates/lanclip-proto",
+    "crates/lanclip-discovery",
+    "crates/lanclip-network",
+    "crates/lanclip-clipboard",
+    "crates/lanclip-transfer",
+    "crates/lanclip-app",
+    "crates/lanclip-ui",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["极数本源"]
+homepage = "https://apizero.cn/"
+repository = "https://github.com/magegojo/lanclip"
+rust-version = "1.78"
+
+[workspace.dependencies]
+# 内部 crate
+lanclip-domain    = { path = "crates/lanclip-domain" }
+lanclip-proto     = { path = "crates/lanclip-proto" }
+lanclip-discovery = { path = "crates/lanclip-discovery" }
+lanclip-network   = { path = "crates/lanclip-network" }
+lanclip-clipboard = { path = "crates/lanclip-clipboard" }
+lanclip-transfer  = { path = "crates/lanclip-transfer" }
+lanclip-app       = { path = "crates/lanclip-app" }
+
+# 异步运行时
+tokio = { version = "1.40", features = ["full"] }
+tokio-util = { version = "0.7", features = ["io"] }
+futures-util = "0.3"
+async-channel = "2.3"
+
+# 序列化
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# 网络
+tokio-tungstenite = { version = "0.26", default-features = false, features = ["connect", "handshake"] }
+mdns-sd = { version = "0.13", default-features = false, features = ["async"] }
+
+# 剪切板（读写 + 平台原生事件监听）
+clipboard-rs = "0.2"
+
+# 工具
+uuid = { version = "1", features = ["v4", "serde"] }
+bytes = { version = "1", features = ["serde"] }
+base64 = "0.22"
+blake3 = "1"
+image = { version = "0.25", default-features = false, features = ["png"] }
+hostname = "0.4"
+directories = "5"
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# 日志 / 错误
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-appender = "0.2"
+thiserror = "2"
+anyhow = "1"
+
+# UI / 系统托盘
+tao = "0.30"
+tray-icon = "0.19"
+global-hotkey = "0.8"
+
+# macOS 原生 API (objc2)
+objc2 = "0.6"
+objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "CFRunLoop"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["NSPasteboard", "NSPasteboardItem"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["NSArray", "NSData", "NSString"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+debug = false
+
+[profile.dev]
+opt-level = 1

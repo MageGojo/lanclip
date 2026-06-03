@@ -1,0 +1,20 @@
+[package]
+name = "lanclip-network"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+lanclip-domain = { workspace = true }
+lanclip-proto = { workspace = true }
+
+tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }
+bytes = { workspace = true }
+
+tracing = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }

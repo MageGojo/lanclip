@@ -1,0 +1,41 @@
+[package]
+name = "lanclip-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "lanclip"
+path = "src/main.rs"
+
+[[bin]]
+name = "lanclip-control"
+path = "src/control_main.rs"
+test = false
+
+[dependencies]
+lanclip-app = { workspace = true }
+lanclip-domain = { workspace = true }
+lanclip-discovery = { workspace = true }
+lanclip-clipboard = { workspace = true }
+
+tokio = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+base64 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+blake3 = { workspace = true }
+uuid = { workspace = true }
+
+tao = { workspace = true }
+tray-icon = { workspace = true }
+global-hotkey = { workspace = true }
+wry = { version = "0.55", features = ["transparent"] }
+gpui = "0.2.2"
+gpui-component = "0.5.1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-core-foundation = { workspace = true }

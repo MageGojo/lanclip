@@ -1,0 +1,35 @@
+[package]
+name = "lanclip-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+lanclip-domain = { workspace = true }
+lanclip-proto = { workspace = true }
+lanclip-discovery = { workspace = true }
+lanclip-network = { workspace = true }
+lanclip-clipboard = { workspace = true }
+lanclip-transfer = { workspace = true }
+
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+directories = { workspace = true }
+hostname = { workspace = true }
+uuid = { workspace = true }
+bytes = { workspace = true }
+base64 = { workspace = true }
+blake3 = { workspace = true }
+rusqlite = { workspace = true }
+image = { workspace = true }
+
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

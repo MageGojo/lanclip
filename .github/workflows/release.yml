@@ -1,0 +1,104 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-x64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: lanclip-windows-x64.zip
+          - name: macos-apple-silicon
+            os: macos-14
+            target: aarch64-apple-darwin
+            archive: lanclip-macos-apple-silicon.tar.gz
+          - name: macos-intel
+            os: macos-13
+            target: x86_64-apple-darwin
+            archive: lanclip-macos-intel.tar.gz
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build release
+        run: cargo build --release -p lanclip-ui --bins --target ${{ matrix.target }}
+
+      - name: Package Unix
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "dist/lanclip-${{ matrix.name }}"
+          cp "target/${{ matrix.target }}/release/lanclip" "dist/lanclip-${{ matrix.name }}/"
+          cp "target/${{ matrix.target }}/release/lanclip-control" "dist/lanclip-${{ matrix.name }}/"
+          cp README.md "dist/lanclip-${{ matrix.name }}/"
+          cp LICENSE "dist/lanclip-${{ matrix.name }}/"
+          cp crates/lanclip-ui/assets/icons/lanclip.svg "dist/lanclip-${{ matrix.name }}/"
+          chmod +x "dist/lanclip-${{ matrix.name }}/lanclip" "dist/lanclip-${{ matrix.name }}/lanclip-control"
+          tar -C dist -czf "dist/${{ matrix.archive }}" "lanclip-${{ matrix.name }}"
+
+      - name: Package Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force "dist/lanclip-${{ matrix.name }}" | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/lanclip.exe" "dist/lanclip-${{ matrix.name }}/"
+          Copy-Item "target/${{ matrix.target }}/release/lanclip-control.exe" "dist/lanclip-${{ matrix.name }}/"
+          Copy-Item "README.md" "dist/lanclip-${{ matrix.name }}/"
+          Copy-Item "LICENSE" "dist/lanclip-${{ matrix.name }}/"
+          Copy-Item "crates/lanclip-ui/assets/icons/lanclip.svg" "dist/lanclip-${{ matrix.name }}/"
+          Compress-Archive -Path "dist/lanclip-${{ matrix.name }}" -DestinationPath "dist/${{ matrix.archive }}" -Force
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: dist/${{ matrix.archive }}
+          if-no-files-found: error
+
+  release:
+    name: GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG_NAME" dist/* \
+            --title "lanclip $TAG_NAME" \
+            --notes "Automated lanclip release for Windows, macOS Apple Silicon, and macOS Intel."
