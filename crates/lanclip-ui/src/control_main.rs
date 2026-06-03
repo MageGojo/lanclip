@@ -9,7 +9,6 @@ use control_api::client;
 use control_api::{ControlPeerDto, ControlStateDto, HistoryItemDto, SettingsPatchDto};
 use gpui::prelude::*;
 use gpui::*;
-use gpui_component::input::{Input, InputState};
 use gpui_component::scroll::ScrollableElement as _;
 use gpui_component::{Icon, IconName, Root};
 
@@ -253,18 +252,20 @@ struct ControlApp {
     state: ControlStateDto,
     tab: Tab,
     error: String,
-    shortcut_input: Option<Entity<InputState>>,
+    shortcut_focus: FocusHandle,
+    recording_shortcut: bool,
 }
 
 impl ControlApp {
-    fn new(base_url: String, token: String) -> Self {
+    fn new(base_url: String, token: String, cx: &mut Context<Self>) -> Self {
         let mut app = Self {
             base_url,
             token,
             state: ControlStateDto::default(),
             tab: Tab::Overview,
             error: String::new(),
-            shortcut_input: None,
+            shortcut_focus: cx.focus_handle().tab_stop(true),
+            recording_shortcut: false,
         };
         app.refresh_now();
         app
@@ -329,16 +330,30 @@ impl ControlApp {
             (false, "files") => "Show File References",
             (true, "launch_at_login") => "开机自启",
             (false, "launch_at_login") => "Launch at Login",
+            (true, "company") => "极数本源",
+            (false, "company") => "Jishu Benyuan",
+            (true, "official_site") => "官方网站",
+            (false, "official_site") => "Official Site",
+            (true, "company_desc") => "API Zero 是极数本源的接口站，提供免费 API、文档与接入示例。",
+            (false, "company_desc") => {
+                "API Zero is our API hub with free APIs, docs, and integration examples."
+            }
             (true, "menu_hotkey") => "唤醒快捷键",
             (false, "menu_hotkey") => "Menu Shortcut",
             (true, "menu_hotkey_hint") => "用于打开剪切板菜单，例如 Command+V 或 Ctrl+Shift+V。",
             (false, "menu_hotkey_hint") => {
                 "Opens the clipboard menu, for example Command+V or Ctrl+Shift+V."
             }
-            (true, "save") => "保存",
-            (false, "save") => "Save",
+            (true, "record_shortcut") => "更改",
+            (false, "record_shortcut") => "Change",
+            (true, "press_shortcut") => "请按下新的快捷键",
+            (false, "press_shortcut") => "Press the new shortcut",
             (true, "restore_default") => "恢复默认",
             (false, "restore_default") => "Default",
+            (true, "shortcut_needs_modifier") => "快捷键至少需要一个修饰键，例如 Command、Ctrl、Option 或 Shift。",
+            (false, "shortcut_needs_modifier") => {
+                "Shortcut must include at least one modifier, such as Command, Ctrl, Alt, or Shift."
+            }
             (true, "refresh") => "刷新",
             (false, "refresh") => "Refresh",
             (true, "device_id") => "设备 ID",
@@ -389,59 +404,63 @@ impl ControlApp {
         cx.notify();
     }
 
-    fn ensure_shortcut_input(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Entity<InputState> {
-        if let Some(input) = &self.shortcut_input {
-            return input.clone();
+    fn start_menu_hotkey_recording(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.recording_shortcut = true;
+        self.error.clear();
+        window.focus(&self.shortcut_focus);
+        cx.notify();
+    }
+
+    fn capture_menu_hotkey(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        if !self.recording_shortcut {
+            return;
         }
-        let value = hotkey_config::display_menu_hotkey(&self.state.menu_hotkey);
-        let placeholder = hotkey_config::display_menu_hotkey(hotkey_config::default_menu_hotkey());
-        let input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder(placeholder)
-                .default_value(value)
-        });
-        self.shortcut_input = Some(input.clone());
-        input
+        cx.stop_propagation();
+        if event.is_held {
+            return;
+        }
+
+        if event.keystroke.key.eq_ignore_ascii_case("escape") {
+            self.recording_shortcut = false;
+            self.error.clear();
+            cx.notify();
+            return;
+        }
+
+        let modifiers = event.keystroke.modifiers;
+        match hotkey_config::normalize_recorded_menu_hotkey(
+            modifiers.platform,
+            modifiers.control,
+            modifiers.alt,
+            modifiers.shift,
+            &event.keystroke.key,
+        ) {
+            Some(spec) => {
+                self.recording_shortcut = false;
+                self.save_settings(
+                    SettingsPatchDto {
+                        menu_hotkey: Some(spec),
+                        ..Default::default()
+                    },
+                    cx,
+                );
+            }
+            None => {
+                self.error = self.tr("shortcut_needs_modifier").to_string();
+                cx.notify();
+            }
+        }
     }
 
-    fn save_menu_hotkey(
-        &mut self,
-        input: Entity<InputState>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let raw = input.read(cx).value().to_string();
+    fn reset_menu_hotkey(&mut self, cx: &mut Context<Self>) {
+        self.recording_shortcut = false;
         self.save_settings(
             SettingsPatchDto {
-                menu_hotkey: Some(raw),
+                menu_hotkey: Some(hotkey_config::default_menu_hotkey().to_string()),
                 ..Default::default()
             },
             cx,
         );
-        let display = hotkey_config::display_menu_hotkey(&self.state.menu_hotkey);
-        input.update(cx, |input, cx| input.set_value(display, window, cx));
-    }
-
-    fn reset_menu_hotkey(
-        &mut self,
-        input: Entity<InputState>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let default = hotkey_config::default_menu_hotkey().to_string();
-        self.save_settings(
-            SettingsPatchDto {
-                menu_hotkey: Some(default),
-                ..Default::default()
-            },
-            cx,
-        );
-        let display = hotkey_config::display_menu_hotkey(&self.state.menu_hotkey);
-        input.update(cx, |input, cx| input.set_value(display, window, cx));
     }
 
     fn confirm_peer(&mut self, peer_id: String, cx: &mut Context<Self>) {
@@ -470,7 +489,7 @@ impl ControlApp {
 impl EventEmitter<()> for ControlApp {}
 
 impl Render for ControlApp {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
         div()
             .size_full()
             .flex()
@@ -493,7 +512,7 @@ impl Render for ControlApp {
                     .child(match self.tab {
                         Tab::Overview => self.overview(cx).into_any_element(),
                         Tab::Devices => self.devices(cx).into_any_element(),
-                        Tab::Settings => self.settings(window, cx).into_any_element(),
+                        Tab::Settings => self.settings(cx).into_any_element(),
                         Tab::History => self.history(cx).into_any_element(),
                         Tab::Transfers => self.transfers(cx).into_any_element(),
                     })
@@ -724,7 +743,7 @@ impl ControlApp {
         }
     }
 
-    fn overview(&mut self, _cx: &mut Context<'_, Self>) -> impl IntoElement {
+    fn overview(&mut self, cx: &mut Context<'_, Self>) -> impl IntoElement {
         div()
             .min_w(px(0.0))
             .child(
@@ -748,6 +767,13 @@ impl ControlApp {
                         self.state.history_count.to_string(),
                     )),
             )
+            .child(company_panel(
+                self.tr("company"),
+                self.tr("official_site"),
+                self.tr("company_desc"),
+                "https://apizero.cn/",
+                cx,
+            ))
             .child(
                 glass_panel()
                     .child(section_label(self.tr("device")))
@@ -851,13 +877,15 @@ impl ControlApp {
             )
     }
 
-    fn settings(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
+    fn settings(&mut self, cx: &mut Context<'_, Self>) -> impl IntoElement {
         let sync = self.state.clipboard_sync_enabled;
         let text = self.state.sync_text;
         let images = self.state.sync_images;
         let files = self.state.show_file_refs;
         let launch = self.state.launch_at_login;
-        let shortcut_input = self.ensure_shortcut_input(window, cx);
+        let shortcut_display = hotkey_config::display_menu_hotkey(&self.state.menu_hotkey);
+        let shortcut_focus = self.shortcut_focus.clone();
+        let recording_shortcut = self.recording_shortcut;
         glass_panel()
             .child(section_label(self.tr("settings")))
             .child(setting_toggle(
@@ -948,9 +976,12 @@ impl ControlApp {
             .child(shortcut_setting(
                 self.tr("menu_hotkey"),
                 self.tr("menu_hotkey_hint"),
-                self.tr("save"),
+                &shortcut_display,
+                recording_shortcut,
+                shortcut_focus,
+                self.tr("record_shortcut"),
+                self.tr("press_shortcut"),
                 self.tr("restore_default"),
-                shortcut_input,
                 cx,
             ))
             .child(row_text(
@@ -1218,6 +1249,88 @@ fn section_label(label: &str) -> impl IntoElement {
         .child(label.to_string())
 }
 
+fn company_panel(
+    company: &str,
+    site_label: &str,
+    detail: &str,
+    url: &'static str,
+    cx: &mut Context<'_, ControlApp>,
+) -> impl IntoElement {
+    div()
+        .mb_5()
+        .rounded(px(14.0))
+        .border_1()
+        .border_color(tone_panel_border())
+        .bg(glass_bg_subtle())
+        .p_4()
+        .min_w(px(0.0))
+        .shadow(soft_shadow())
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_4()
+                .min_w(px(0.0))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_3()
+                        .min_w(px(0.0))
+                        .child(icon_tile(IconName::Globe, false))
+                        .child(
+                            div().min_w(px(0.0)).child(
+                                div()
+                                    .text_base()
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(tone_text())
+                                    .truncate()
+                                    .child(company.to_string()),
+                            ),
+                        ),
+                )
+                .child(
+                    div()
+                        .id("company-site-link")
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .flex_none()
+                        .px_3()
+                        .py_1()
+                        .rounded(px(999.0))
+                        .border_1()
+                        .border_color(rgba(0x9bd1ffe8))
+                        .bg(active_nav_bg())
+                        .text_xs()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(tone_accent_dark())
+                        .cursor(CursorStyle::PointingHand)
+                        .hover(|s| s.bg(glass_bg()).border_color(rgba(0x62b8ffff)))
+                        .on_click(cx.listener(move |_, _: &ClickEvent, _w, cx| cx.open_url(url)))
+                        .child(site_label.to_string())
+                        .child(
+                            div()
+                                .max_w(px(220.0))
+                                .truncate()
+                                .font_weight(FontWeight::MEDIUM)
+                                .child(url.to_string()),
+                        ),
+                ),
+        )
+        .child(
+            div()
+                .mt_3()
+                .ml(px(40.0))
+                .max_w(px(620.0))
+                .text_sm()
+                .line_height(relative(1.35))
+                .text_color(tone_muted())
+                .child(detail.to_string()),
+        )
+}
+
 fn row_text(label: &str, value: &str) -> impl IntoElement {
     div()
         .flex()
@@ -1304,13 +1417,14 @@ fn setting_toggle(
 fn shortcut_setting(
     label: &str,
     detail: &str,
-    save_label: &str,
+    value: &str,
+    recording: bool,
+    focus_handle: FocusHandle,
+    record_label: &str,
+    recording_label: &str,
     default_label: &str,
-    input: Entity<InputState>,
     cx: &mut Context<'_, ControlApp>,
 ) -> impl IntoElement {
-    let save_input = input.clone();
-    let default_input = input.clone();
     div()
         .flex()
         .items_center()
@@ -1320,6 +1434,10 @@ fn shortcut_setting(
         .py_3()
         .border_b_1()
         .border_color(tone_divider())
+        .track_focus(&focus_handle)
+        .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
+            this.capture_menu_hotkey(event, cx);
+        }))
         .child(
             div()
                 .min_w(px(0.0))
@@ -1348,30 +1466,46 @@ fn shortcut_setting(
                 .gap_2()
                 .child(
                     div()
-                        .w(px(252.0))
+                        .w(px(232.0))
                         .h(px(34.0))
                         .rounded(px(9.0))
                         .border_1()
-                        .border_color(rgba(0xcbdff3e8))
-                        .bg(glass_bg_subtle())
-                        .px_2()
+                        .border_color(if recording {
+                            rgba(0x69b6ffff)
+                        } else {
+                            rgba(0xcbdff3e8)
+                        })
+                        .bg(if recording {
+                            active_nav_bg()
+                        } else {
+                            glass_bg_subtle()
+                        })
+                        .px_3()
                         .flex()
                         .items_center()
+                        .justify_center()
                         .shadow(inset_highlight())
-                        .child(
-                            Input::new(&input)
-                                .appearance(false)
-                                .bordered(false)
-                                .w_full(),
-                        ),
+                        .text_xs()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(if recording {
+                            tone_accent_dark()
+                        } else {
+                            tone_text()
+                        })
+                        .truncate()
+                        .child(if recording {
+                            recording_label.to_string()
+                        } else {
+                            value.to_string()
+                        }),
                 )
                 .child(shortcut_button(
-                    "save_menu_hotkey",
-                    save_label,
-                    true,
+                    "record_menu_hotkey",
+                    record_label,
+                    recording,
                     cx,
                     move |this, window, cx| {
-                        this.save_menu_hotkey(save_input.clone(), window, cx);
+                        this.start_menu_hotkey_recording(window, cx);
                     },
                 ))
                 .child(shortcut_button(
@@ -1379,8 +1513,8 @@ fn shortcut_setting(
                     default_label,
                     false,
                     cx,
-                    move |this, window, cx| {
-                        this.reset_menu_hotkey(default_input.clone(), window, cx);
+                    move |this, _window, cx| {
+                        this.reset_menu_hotkey(cx);
                     },
                 )),
         )
@@ -1654,7 +1788,7 @@ fn main() -> anyhow::Result<()> {
                     ..Default::default()
                 },
                 |window, cx| {
-                    let app = cx.new(|_cx| ControlApp::new(base_url.clone(), token.clone()));
+                    let app = cx.new(|cx| ControlApp::new(base_url.clone(), token.clone(), cx));
                     cx.new(|cx| Root::new(app, window, cx))
                 },
             )
