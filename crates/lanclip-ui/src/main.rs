@@ -1,17 +1,15 @@
 //! lanclip desktop entry: menu-bar icon, native fallback menu, and searchable panel.
 
 mod control_api;
+mod hotkey_config;
 mod tray;
 mod web_panel;
 
 use std::process::{Child, Command};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
-use control_api::{start_control_server, ControlEndpoint};
-use global_hotkey::{
-    hotkey::{Code, HotKey, Modifiers},
-    GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState,
-};
+use control_api::{start_control_server, ControlEndpoint, ControlRuntimeEvent, RuntimeNotify};
+use global_hotkey::{hotkey::HotKey, GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 use lanclip_app::{logging, Application, ClipboardHistory, HistoryEntry};
 use lanclip_clipboard::ClipboardService;
 use lanclip_domain::{ClipboardPayload, ContentHash};
@@ -26,6 +24,7 @@ enum UserEvent {
     HistoryUpdated,
     Tray(TrayIconEvent),
     HotKey(GlobalHotKeyEvent),
+    MenuHotkeyChanged,
     Panel(PanelAction),
 }
 
@@ -39,16 +38,10 @@ fn main() -> anyhow::Result<()> {
 
     let history = app.clipboard_history.clone();
     let clipboard = app.clipboard.clone();
+    let config = app.config.clone();
+    let conn_mgr = app.conn_mgr.clone();
     let self_id = app.self_id.clone();
     let port = app.listener_port;
-    let control_endpoint = start_control_server(
-        self_id.clone(),
-        port,
-        app.config.clone(),
-        history.clone(),
-        app.conn_mgr.clone(),
-        rt.handle().clone(),
-    )?;
     let _app = Mutex::new(Some(app));
     let rt_h = rt.handle().clone();
     let _rt = rt;
@@ -62,6 +55,24 @@ fn main() -> anyhow::Result<()> {
     }
     let px = el.create_proxy();
 
+    let control_notify: RuntimeNotify = Arc::new({
+        let px = px.clone();
+        move |event| match event {
+            ControlRuntimeEvent::MenuHotkeyChanged => {
+                let _ = px.send_event(UserEvent::MenuHotkeyChanged);
+            }
+        }
+    });
+    let control_endpoint = start_control_server(
+        self_id.clone(),
+        port,
+        config.clone(),
+        history.clone(),
+        conn_mgr,
+        rt_h.clone(),
+        Some(control_notify),
+    )?;
+
     {
         let px = px.clone();
         TrayIconEvent::set_event_handler(Some(move |e: TrayIconEvent| {
@@ -69,8 +80,9 @@ fn main() -> anyhow::Result<()> {
         }));
     }
 
-    let clipboard_hotkey = clipboard_hotkey();
-    let hotkey_manager = register_clipboard_hotkey(clipboard_hotkey);
+    let mut clipboard_hotkey = clipboard_hotkey_from_config(&config, &rt_h);
+    let hotkey_manager = create_hotkey_manager();
+    register_clipboard_hotkey(&hotkey_manager, clipboard_hotkey);
     {
         let px = px.clone();
         GlobalHotKeyEvent::set_event_handler(Some(move |e: GlobalHotKeyEvent| {
@@ -140,6 +152,11 @@ fn main() -> anyhow::Result<()> {
                 toggle_panel(&mut panel, &history, None);
             }
 
+            Event::UserEvent(UserEvent::MenuHotkeyChanged) => {
+                let next_hotkey = clipboard_hotkey_from_config(&config, &rt_h);
+                update_clipboard_hotkey(&hotkey_manager, &mut clipboard_hotkey, next_hotkey);
+            }
+
             Event::UserEvent(UserEvent::Panel(action)) => match action {
                 PanelAction::Select(hash) => {
                     panel.hide();
@@ -178,30 +195,63 @@ fn main() -> anyhow::Result<()> {
     });
 }
 
-fn clipboard_hotkey() -> HotKey {
-    #[cfg(target_os = "macos")]
-    let mods = Modifiers::SUPER | Modifiers::SHIFT;
-    #[cfg(not(target_os = "macos"))]
-    let mods = Modifiers::CONTROL | Modifiers::SHIFT;
-    HotKey::new(Some(mods), Code::KeyV)
+fn clipboard_hotkey_from_config(
+    config: &std::sync::Arc<tokio::sync::RwLock<lanclip_app::AppConfig>>,
+    rt_h: &tokio::runtime::Handle,
+) -> HotKey {
+    let spec = rt_h.block_on(async { config.read().await.menu_hotkey.clone() });
+    hotkey_config::parse_menu_hotkey(&spec)
 }
 
-fn register_clipboard_hotkey(hotkey: HotKey) -> Option<GlobalHotKeyManager> {
-    let manager = match GlobalHotKeyManager::new() {
-        Ok(manager) => manager,
+fn create_hotkey_manager() -> Option<GlobalHotKeyManager> {
+    match GlobalHotKeyManager::new() {
+        Ok(manager) => Some(manager),
         Err(e) => {
             warn!("global hotkey manager unavailable: {e}");
-            return None;
+            None
         }
+    }
+}
+
+fn register_clipboard_hotkey(manager: &Option<GlobalHotKeyManager>, hotkey: HotKey) {
+    let Some(manager) = manager else {
+        return;
     };
     match manager.register(hotkey) {
         Ok(()) => {
             info!("global clipboard hotkey registered: {hotkey}");
-            Some(manager)
         }
         Err(e) => {
             warn!("global clipboard hotkey unavailable ({hotkey}): {e}");
-            None
+        }
+    }
+}
+
+fn update_clipboard_hotkey(
+    manager: &Option<GlobalHotKeyManager>,
+    current: &mut HotKey,
+    next: HotKey,
+) {
+    if current.id() == next.id() {
+        return;
+    }
+    let Some(manager) = manager else {
+        *current = next;
+        return;
+    };
+    if let Err(e) = manager.unregister(*current) {
+        warn!("unregister clipboard hotkey failed ({current}): {e}");
+    }
+    match manager.register(next) {
+        Ok(()) => {
+            info!("global clipboard hotkey updated: {next}");
+            *current = next;
+        }
+        Err(e) => {
+            warn!("global clipboard hotkey unavailable ({next}): {e}");
+            if let Err(restore) = manager.register(*current) {
+                warn!("restore clipboard hotkey failed ({current}): {restore}");
+            }
         }
     }
 }

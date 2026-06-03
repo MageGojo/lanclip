@@ -1,6 +1,7 @@
 #![recursion_limit = "1024"]
 
 mod control_api;
+mod hotkey_config;
 
 use std::borrow::Cow;
 
@@ -8,6 +9,7 @@ use control_api::client;
 use control_api::{ControlPeerDto, ControlStateDto, HistoryItemDto, SettingsPatchDto};
 use gpui::prelude::*;
 use gpui::*;
+use gpui_component::input::{Input, InputState};
 use gpui_component::scroll::ScrollableElement as _;
 use gpui_component::{Icon, IconName, Root};
 
@@ -251,6 +253,7 @@ struct ControlApp {
     state: ControlStateDto,
     tab: Tab,
     error: String,
+    shortcut_input: Option<Entity<InputState>>,
 }
 
 impl ControlApp {
@@ -261,6 +264,7 @@ impl ControlApp {
             state: ControlStateDto::default(),
             tab: Tab::Overview,
             error: String::new(),
+            shortcut_input: None,
         };
         app.refresh_now();
         app
@@ -325,6 +329,16 @@ impl ControlApp {
             (false, "files") => "Show File References",
             (true, "launch_at_login") => "开机自启",
             (false, "launch_at_login") => "Launch at Login",
+            (true, "menu_hotkey") => "唤醒快捷键",
+            (false, "menu_hotkey") => "Menu Shortcut",
+            (true, "menu_hotkey_hint") => "用于打开剪切板菜单，例如 Command+V 或 Ctrl+Shift+V。",
+            (false, "menu_hotkey_hint") => {
+                "Opens the clipboard menu, for example Command+V or Ctrl+Shift+V."
+            }
+            (true, "save") => "保存",
+            (false, "save") => "Save",
+            (true, "restore_default") => "恢复默认",
+            (false, "restore_default") => "Default",
             (true, "refresh") => "刷新",
             (false, "refresh") => "Refresh",
             (true, "device_id") => "设备 ID",
@@ -375,6 +389,61 @@ impl ControlApp {
         cx.notify();
     }
 
+    fn ensure_shortcut_input(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<InputState> {
+        if let Some(input) = &self.shortcut_input {
+            return input.clone();
+        }
+        let value = hotkey_config::display_menu_hotkey(&self.state.menu_hotkey);
+        let placeholder = hotkey_config::display_menu_hotkey(hotkey_config::default_menu_hotkey());
+        let input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(placeholder)
+                .default_value(value)
+        });
+        self.shortcut_input = Some(input.clone());
+        input
+    }
+
+    fn save_menu_hotkey(
+        &mut self,
+        input: Entity<InputState>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let raw = input.read(cx).value().to_string();
+        self.save_settings(
+            SettingsPatchDto {
+                menu_hotkey: Some(raw),
+                ..Default::default()
+            },
+            cx,
+        );
+        let display = hotkey_config::display_menu_hotkey(&self.state.menu_hotkey);
+        input.update(cx, |input, cx| input.set_value(display, window, cx));
+    }
+
+    fn reset_menu_hotkey(
+        &mut self,
+        input: Entity<InputState>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let default = hotkey_config::default_menu_hotkey().to_string();
+        self.save_settings(
+            SettingsPatchDto {
+                menu_hotkey: Some(default),
+                ..Default::default()
+            },
+            cx,
+        );
+        let display = hotkey_config::display_menu_hotkey(&self.state.menu_hotkey);
+        input.update(cx, |input, cx| input.set_value(display, window, cx));
+    }
+
     fn confirm_peer(&mut self, peer_id: String, cx: &mut Context<Self>) {
         match client::confirm_peer(&self.base_url, &self.token, &peer_id) {
             Ok(state) => {
@@ -401,7 +470,7 @@ impl ControlApp {
 impl EventEmitter<()> for ControlApp {}
 
 impl Render for ControlApp {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
         div()
             .size_full()
             .flex()
@@ -424,7 +493,7 @@ impl Render for ControlApp {
                     .child(match self.tab {
                         Tab::Overview => self.overview(cx).into_any_element(),
                         Tab::Devices => self.devices(cx).into_any_element(),
-                        Tab::Settings => self.settings(cx).into_any_element(),
+                        Tab::Settings => self.settings(window, cx).into_any_element(),
                         Tab::History => self.history(cx).into_any_element(),
                         Tab::Transfers => self.transfers(cx).into_any_element(),
                     })
@@ -782,12 +851,13 @@ impl ControlApp {
             )
     }
 
-    fn settings(&mut self, cx: &mut Context<'_, Self>) -> impl IntoElement {
+    fn settings(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
         let sync = self.state.clipboard_sync_enabled;
         let text = self.state.sync_text;
         let images = self.state.sync_images;
         let files = self.state.show_file_refs;
         let launch = self.state.launch_at_login;
+        let shortcut_input = self.ensure_shortcut_input(window, cx);
         glass_panel()
             .child(section_label(self.tr("settings")))
             .child(setting_toggle(
@@ -874,6 +944,14 @@ impl ControlApp {
                         cx,
                     )
                 },
+            ))
+            .child(shortcut_setting(
+                self.tr("menu_hotkey"),
+                self.tr("menu_hotkey_hint"),
+                self.tr("save"),
+                self.tr("restore_default"),
+                shortcut_input,
+                cx,
             ))
             .child(row_text(
                 self.tr("language"),
@@ -1221,6 +1299,134 @@ fn setting_toggle(
                 )
                 .child(toggle_switch(value)),
         )
+}
+
+fn shortcut_setting(
+    label: &str,
+    detail: &str,
+    save_label: &str,
+    default_label: &str,
+    input: Entity<InputState>,
+    cx: &mut Context<'_, ControlApp>,
+) -> impl IntoElement {
+    let save_input = input.clone();
+    let default_input = input.clone();
+    div()
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap_4()
+        .min_w(px(0.0))
+        .py_3()
+        .border_b_1()
+        .border_color(tone_divider())
+        .child(
+            div()
+                .min_w(px(0.0))
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(tone_text())
+                        .truncate()
+                        .child(label.to_string()),
+                )
+                .child(
+                    div()
+                        .mt_1()
+                        .text_xs()
+                        .text_color(tone_muted())
+                        .line_clamp(2)
+                        .child(detail.to_string()),
+                ),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_none()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .w(px(252.0))
+                        .h(px(34.0))
+                        .rounded(px(9.0))
+                        .border_1()
+                        .border_color(rgba(0xcbdff3e8))
+                        .bg(glass_bg_subtle())
+                        .px_2()
+                        .flex()
+                        .items_center()
+                        .shadow(inset_highlight())
+                        .child(
+                            Input::new(&input)
+                                .appearance(false)
+                                .bordered(false)
+                                .w_full(),
+                        ),
+                )
+                .child(shortcut_button(
+                    "save_menu_hotkey",
+                    save_label,
+                    true,
+                    cx,
+                    move |this, window, cx| {
+                        this.save_menu_hotkey(save_input.clone(), window, cx);
+                    },
+                ))
+                .child(shortcut_button(
+                    "reset_menu_hotkey",
+                    default_label,
+                    false,
+                    cx,
+                    move |this, window, cx| {
+                        this.reset_menu_hotkey(default_input.clone(), window, cx);
+                    },
+                )),
+        )
+}
+
+fn shortcut_button(
+    id: &str,
+    label: &str,
+    active: bool,
+    cx: &mut Context<'_, ControlApp>,
+    f: impl Fn(&mut ControlApp, &mut Window, &mut Context<ControlApp>) + 'static,
+) -> impl IntoElement {
+    div()
+        .id(ElementId::from(SharedString::from(id.to_string())))
+        .px_3()
+        .py_1()
+        .rounded(px(8.0))
+        .border_1()
+        .border_color(if active {
+            rgba(0x72bdffff)
+        } else {
+            rgba(0xd8e4f0e8)
+        })
+        .bg(if active {
+            accent_bg()
+        } else {
+            glass_bg_subtle()
+        })
+        .text_color(if active {
+            rgba(0xffffffff)
+        } else {
+            rgba(0x334155ff)
+        })
+        .text_xs()
+        .font_weight(FontWeight::MEDIUM)
+        .shadow(vec![box_shadow(
+            px(0.0),
+            px(8.0),
+            px(18.0),
+            px(-16.0),
+            hsla(210.0, 0.35, 0.28, 0.16),
+        )])
+        .cursor(CursorStyle::PointingHand)
+        .hover(|s| s.opacity(0.92))
+        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| f(this, window, cx)))
+        .child(label.to_string())
 }
 
 fn toggle_switch(value: bool) -> impl IntoElement {

@@ -44,6 +44,9 @@ pub struct AppConfig {
     /// 是否登录后自动启动 lanclip。
     #[serde(default)]
     pub launch_at_login: bool,
+    /// 唤醒剪切板菜单的全局快捷键。
+    #[serde(default = "default_menu_hotkey")]
+    pub menu_hotkey: String,
     /// 已通过确认码配对的设备。
     #[serde(default)]
     pub trusted_peers: Vec<DeviceId>,
@@ -59,6 +62,17 @@ fn default_true() -> bool {
 
 fn default_language() -> String {
     "zh".to_string()
+}
+
+fn default_menu_hotkey() -> String {
+    #[cfg(target_os = "macos")]
+    {
+        "command+KeyV".to_string()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        "control+shift+KeyV".to_string()
+    }
 }
 
 impl AppConfig {
@@ -105,6 +119,7 @@ impl AppConfig {
             show_file_refs: true,
             language: default_language(),
             launch_at_login: false,
+            menu_hotkey: default_menu_hotkey(),
             trusted_peers: Vec::new(),
         })
     }

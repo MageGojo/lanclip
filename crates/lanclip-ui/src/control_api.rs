@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::hotkey_config;
 use lanclip_app::{AppConfig, ClipboardHistory, ConnectionManager, HistoryEntry, Msg};
 use lanclip_domain::{ClipboardPayload, DeviceId};
 use serde::{Deserialize, Serialize};
@@ -18,6 +19,13 @@ pub struct ControlEndpoint {
     pub base_url: String,
     pub token: String,
 }
+
+#[derive(Debug, Clone, Copy)]
+pub enum ControlRuntimeEvent {
+    MenuHotkeyChanged,
+}
+
+pub type RuntimeNotify = Arc<dyn Fn(ControlRuntimeEvent) + Send + Sync + 'static>;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -34,6 +42,7 @@ pub struct ControlStateDto {
     pub sync_images: bool,
     pub show_file_refs: bool,
     pub launch_at_login: bool,
+    pub menu_hotkey: String,
     pub peers: Vec<ControlPeerDto>,
     pub history: Vec<HistoryItemDto>,
 }
@@ -68,6 +77,7 @@ pub struct SettingsPatchDto {
     pub sync_images: Option<bool>,
     pub show_file_refs: Option<bool>,
     pub launch_at_login: Option<bool>,
+    pub menu_hotkey: Option<String>,
     pub language: Option<String>,
 }
 
@@ -84,6 +94,7 @@ pub fn start_control_server(
     history: Arc<ClipboardHistory>,
     conn_mgr: Arc<ConnectionManager>,
     rt: Handle,
+    runtime_notify: Option<RuntimeNotify>,
 ) -> anyhow::Result<ControlEndpoint> {
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let addr = listener.local_addr()?;
@@ -104,6 +115,7 @@ pub fn start_control_server(
                         &history,
                         &conn_mgr,
                         &rt,
+                        runtime_notify.as_ref(),
                     ),
                     Err(e) => warn!("control api accept failed: {e}"),
                 }
@@ -135,6 +147,7 @@ fn handle_stream(
     history: &Arc<ClipboardHistory>,
     conn_mgr: &Arc<ConnectionManager>,
     rt: &Handle,
+    runtime_notify: Option<&RuntimeNotify>,
 ) {
     let mut buf = vec![0u8; 1024 * 128];
     let Ok(n) = stream.read(&mut buf) else {
@@ -176,7 +189,8 @@ fn handle_stream(
                         return;
                     }
                 }
-                rt.block_on(async {
+                let hotkey_changed = rt.block_on(async {
+                    let mut hotkey_changed = false;
                     let mut cfg = config.write().await;
                     if let Some(name) = patch.device_name.map(|s| s.trim().to_string()) {
                         if !name.is_empty() {
@@ -198,13 +212,29 @@ fn handle_stream(
                     if let Some(v) = patch.launch_at_login {
                         cfg.launch_at_login = v;
                     }
+                    if let Some(raw) = patch.menu_hotkey {
+                        if let Some(normalized) = hotkey_config::normalize_menu_hotkey(&raw) {
+                            if cfg.menu_hotkey != normalized {
+                                cfg.menu_hotkey = normalized;
+                                hotkey_changed = true;
+                            }
+                        } else {
+                            warn!("ignore invalid menu hotkey: {raw}");
+                        }
+                    }
                     if let Some(lang) = patch.language {
                         cfg.language = if lang == "en" { "en" } else { "zh" }.to_string();
                     }
                     if let Err(e) = cfg.save() {
                         warn!("save config failed: {e}");
                     }
+                    hotkey_changed
                 });
+                if hotkey_changed {
+                    if let Some(notify) = runtime_notify {
+                        notify(ControlRuntimeEvent::MenuHotkeyChanged);
+                    }
+                }
                 let state = build_state(config, self_id, lan_port, history, conn_mgr, rt);
                 write_json(&mut stream, 200, &state);
             }
@@ -339,6 +369,7 @@ fn build_state(
         sync_images: cfg.sync_images,
         show_file_refs: cfg.show_file_refs,
         launch_at_login: cfg.launch_at_login,
+        menu_hotkey: cfg.menu_hotkey,
         peers,
         history: history_items,
     }
@@ -616,11 +647,13 @@ mod tests {
         let patch = SettingsPatchDto {
             language: Some("zh".into()),
             launch_at_login: Some(true),
+            menu_hotkey: Some("command+KeyV".into()),
             ..Default::default()
         };
         let json = serde_json::to_string(&patch).unwrap();
         assert!(json.contains("language"));
         assert!(json.contains("launchAtLogin"));
+        assert!(json.contains("menuHotkey"));
     }
 
     #[cfg(target_os = "macos")]
