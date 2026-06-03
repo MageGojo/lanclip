@@ -11,13 +11,18 @@ UninstallIcon "${ICON_PATH}"
 !ifndef APP_VERSION
 !define APP_VERSION "0.1.0"
 !endif
+!ifndef APP_VERSION_QUAD
+!define APP_VERSION_QUAD "0.1.0.0"
+!endif
 
-VIAddVersionKey "ProductName" "lanclip"
-VIAddVersionKey "CompanyName" "极数本源"
-VIAddVersionKey "FileDescription" "LAN clipboard and file transfer tool"
-VIAddVersionKey "FileVersion" "${APP_VERSION}"
-VIAddVersionKey "ProductVersion" "${APP_VERSION}"
-VIAddVersionKey "LegalCopyright" "Copyright (c) 2026 极数本源"
+SetCompressor /SOLID lzma
+VIProductVersion "${APP_VERSION_QUAD}"
+VIAddVersionKey /LANG=1033 "ProductName" "lanclip"
+VIAddVersionKey /LANG=1033 "CompanyName" "极数本源"
+VIAddVersionKey /LANG=1033 "FileDescription" "LAN clipboard and file transfer tool"
+VIAddVersionKey /LANG=1033 "FileVersion" "${APP_VERSION}"
+VIAddVersionKey /LANG=1033 "ProductVersion" "${APP_VERSION}"
+VIAddVersionKey /LANG=1033 "LegalCopyright" "Copyright (c) 2026 极数本源"
 
 Page directory
 Page instfiles

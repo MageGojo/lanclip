@@ -71,6 +71,12 @@ jobs:
           $version = "${{ github.ref_name }}"
           if ($version.StartsWith("v")) { $version = $version.Substring(1) }
           if ($version -eq "main" -or [string]::IsNullOrWhiteSpace($version)) { $version = "0.1.0" }
+          $parts = @()
+          foreach ($part in ($version -split '\.')) {
+            if ($part -match '^\d+$') { $parts += $part } else { $parts += "0" }
+          }
+          while ($parts.Count -lt 4) { $parts += "0" }
+          $versionQuad = ($parts[0..3] -join ".")
           $stage = (Resolve-Path ".").Path + "\dist\stage-${{ matrix.name }}"
           $icons = (Resolve-Path ".").Path + "\dist\icons"
           New-Item -ItemType Directory -Force $stage, $icons | Out-Null
@@ -84,6 +90,7 @@ jobs:
           if (!(Test-Path $makensis)) { $makensis = "makensis" }
           & $makensis `
             "/DAPP_VERSION=$version" `
+            "/DAPP_VERSION_QUAD=$versionQuad" `
             "/DSTAGE_DIR=$stage" `
             "/DOUTPUT_EXE=$((Resolve-Path ".").Path)\dist\${{ matrix.asset }}" `
             "/DICON_PATH=$stage\lanclip.ico" `
