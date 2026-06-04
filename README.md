@@ -62,7 +62,6 @@ lanclip 适合这些日常场景：
 
 ## Compared With Other Clipboard Tools
 
-lanclip 不替代所有剪切板工具的高级能力，它更专注“免费、轻量、Rust 原生、Mac/Windows、局域网同步、可信配对”这几个关键词。
 
 | Tool | Common Focus | lanclip 的不同点 |
 | --- | --- | --- |
