@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use lanclip_domain::{DeviceId, FileEntry, TaskId};
 use lanclip_proto::{FileEntryMeta, Msg};
@@ -17,12 +17,16 @@ use lanclip_transfer::{
     TransferError as TxError,
 };
 use thiserror::Error;
-use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
+use tokio::sync::{broadcast, mpsc, oneshot, Mutex, RwLock};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+use crate::config::AppConfig;
 use crate::connections::{ConnEvent, ConnectionManager, NewDataConn};
+
+/// 接收任务在没有任何 FileBegin/进度更新的情况下，最多保活多久（防止发送方掉线后槽位泄漏）。
+const RECV_TASK_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
 // ============================================================================
 // 错误
@@ -64,11 +68,20 @@ pub type Result<T> = std::result::Result<T, TransferSvcError>;
 // 配置
 // ============================================================================
 
+/// 传输服务的静态兜底配置（实际运行时优先读取 `Arc<RwLock<AppConfig>>`）。
 #[derive(Debug, Clone)]
 pub struct TransferSvcConfig {
     pub download_root: PathBuf,
     pub parallelism: usize,
     pub auto_accept: bool,
+}
+
+/// 运行时从 `AppConfig` 解析出的有效传输设置（每次处理 offer / 发送时实时读取）。
+#[derive(Debug, Clone)]
+struct EffectiveConfig {
+    download_root: PathBuf,
+    parallelism: usize,
+    auto_accept: bool,
 }
 
 // ============================================================================
@@ -104,6 +117,9 @@ struct IncomingTask {
     /// 否则 outbound mpsc 关闭 → writer task close WS → 对端 reader 关闭 → inbound 中断。
     data_handles: Vec<lanclip_network::ConnHandle>,
     started_at: Instant,
+    /// 上次有数据进展（用于清道夫判定僵尸任务）。
+    last_progress_bytes: u64,
+    last_active_at: Instant,
 }
 
 #[allow(dead_code)] // task_id/peer_id 供调试/未来查询使用
@@ -121,22 +137,30 @@ pub struct TransferService {
     #[allow(dead_code)] // 预留给日后冲突检查/源头样查询
     self_id: DeviceId,
     conn_mgr: Arc<ConnectionManager>,
-    config: TransferSvcConfig,
+    /// 静态兜底（无 app_config 时使用，主要用于单测）。
+    fallback: TransferSvcConfig,
+    /// 运行时配置来源；存在时优先读取，使下载目录/并发度/自动接受/信任列表热更新。
+    app_config: Option<Arc<RwLock<AppConfig>>>,
     state: Mutex<TransferState>,
 }
 
 impl TransferService {
-    /// 启动服务：spawn 两个常驻 task（控制事件路由 + 数据连接路由）。
+    /// 启动服务：spawn 常驻 task（控制事件路由 + 数据连接路由 + 接收任务清道夫）。
+    ///
+    /// `app_config` 提供后，传输服务会实时读取并发度 / 自动接受 / 下载目录 / 信任列表，
+    /// 无需重启即可生效，并对未配对设备拒绝接收。
     pub fn spawn(
         self_id: DeviceId,
         conn_mgr: Arc<ConnectionManager>,
         new_data_rx: mpsc::Receiver<NewDataConn>,
         config: TransferSvcConfig,
+        app_config: Option<Arc<RwLock<AppConfig>>>,
     ) -> Arc<Self> {
         let svc = Arc::new(Self {
             self_id,
             conn_mgr: conn_mgr.clone(),
-            config,
+            fallback: config,
+            app_config,
             state: Mutex::new(TransferState::new()),
         });
 
@@ -149,7 +173,41 @@ impl TransferService {
         let svc_for_data = svc.clone();
         tokio::spawn(run_data_conn_loop(svc_for_data, new_data_rx));
 
+        // 接收任务清道夫：定期清理掉线发送方留下的僵尸接收任务
+        let svc_for_sweep = svc.clone();
+        tokio::spawn(run_recv_sweeper(svc_for_sweep));
+
         svc
+    }
+
+    /// 读取当前有效配置（优先 app_config，回退到静态配置）。
+    async fn effective_config(&self) -> EffectiveConfig {
+        if let Some(cfg) = &self.app_config {
+            let c = cfg.read().await;
+            return EffectiveConfig {
+                download_root: c.download_dir.clone(),
+                parallelism: c.transfer_parallelism.max(1),
+                auto_accept: c.auto_accept_transfer,
+            };
+        }
+        EffectiveConfig {
+            download_root: self.fallback.download_root.clone(),
+            parallelism: self.fallback.parallelism.max(1),
+            auto_accept: self.fallback.auto_accept,
+        }
+    }
+
+    /// 判断 peer 是否已配对信任。无 app_config 时默认放行（单测场景）。
+    async fn is_trusted(&self, peer_id: &DeviceId) -> bool {
+        match &self.app_config {
+            Some(cfg) => cfg
+                .read()
+                .await
+                .trusted_peers
+                .iter()
+                .any(|id| id == peer_id),
+            None => true,
+        }
     }
 
     /// 发送文件（UI 调用）。**当前不支持文件夹**。
@@ -241,7 +299,12 @@ impl TransferService {
         }
 
         // 3. 建立 N 条数据连接
-        let n = self.config.parallelism.min(entries.len()).max(1);
+        let n = self
+            .effective_config()
+            .await
+            .parallelism
+            .min(entries.len())
+            .max(1);
         let mut data_conns = Vec::with_capacity(n);
         for i in 0..n {
             let (handle, inbound) = self.conn_mgr.dial_data(peer_id).await?;
@@ -309,8 +372,25 @@ impl TransferService {
             entries.len()
         );
 
-        if !self.config.auto_accept {
-            // M5 阶段：未实现弹窗，等价于自动拒绝
+        // ★ 安全：只接受已配对设备的文件，未信任的 peer 一律拒绝（与剪切板同步一致）。
+        if !self.is_trusted(&peer_id).await {
+            warn!("recv: rejecting offer from untrusted peer {peer_id}");
+            let _ = self
+                .conn_mgr
+                .send_control(
+                    &peer_id,
+                    &Msg::TransferReject {
+                        task_id,
+                        reason: "not paired".into(),
+                    },
+                )
+                .await;
+            return;
+        }
+
+        let eff = self.effective_config().await;
+        if !eff.auto_accept {
+            // 未启用自动接受 + 尚无弹窗确认 → 拒绝
             let _ = self
                 .conn_mgr
                 .send_control(
@@ -355,7 +435,7 @@ impl TransferService {
             .collect();
         let expected = RecvTaskExpect::new(expected_entries);
         let sender_name = peer_id.0.clone(); // 简化：用 id 当目录名（精确名字未来从 PeerRegistry 拿）
-        let download_root = self.config.download_root.join(&sender_name);
+        let download_root = eff.download_root.join(&sender_name);
 
         {
             let mut st = self.state.lock().await;
@@ -371,6 +451,8 @@ impl TransferService {
                     workers: Vec::new(),
                     data_handles: Vec::new(),
                     started_at: Instant::now(),
+                    last_progress_bytes: 0,
+                    last_active_at: Instant::now(),
                 },
             );
         }
@@ -447,9 +529,14 @@ impl TransferService {
 
     async fn handle_cancel(self: &Arc<Self>, peer_id: DeviceId, task_id: TaskId) {
         info!("recv: TransferCancel from {peer_id} task={task_id}");
+        self.abort_incoming(&peer_id).await;
+    }
+
+    /// 中止并移除某 peer 的接收任务（取消所有 worker，清理临时分片由 worker 自身负责）。
+    async fn abort_incoming(self: &Arc<Self>, peer_id: &DeviceId) {
         let task = {
             let mut st = self.state.lock().await;
-            st.incoming.remove(&peer_id)
+            st.incoming.remove(peer_id)
         };
         if let Some(t) = task {
             for w in t.workers {
@@ -512,6 +599,10 @@ async fn run_control_event_loop(
             Ok(ConnEvent::ControlMessage { peer_id, msg }) => {
                 svc.on_control_msg(peer_id, msg).await;
             }
+            Ok(ConnEvent::ControlDisconnected { peer_id }) => {
+                // 发送方控制连接断开 → 清理其僵尸接收任务，释放 per-peer 槽位。
+                svc.abort_incoming(&peer_id).await;
+            }
             Ok(_) => {}
             Err(broadcast::error::RecvError::Lagged(n)) => {
                 warn!("transfer-svc: control events lagged: {n}");
@@ -527,6 +618,36 @@ async fn run_data_conn_loop(svc: Arc<TransferService>, mut rx: mpsc::Receiver<Ne
         svc.on_new_data_conn(conn).await;
     }
     debug!("transfer-svc: data conn loop exit");
+}
+
+/// 接收任务清道夫：定期检查所有 incoming 任务，
+/// 若长时间（`RECV_TASK_IDLE_TIMEOUT`）没有任何字节进展，则判定发送方掉线，清理之。
+async fn run_recv_sweeper(svc: Arc<TransferService>) {
+    let mut ticker = tokio::time::interval(Duration::from_secs(15));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        ticker.tick().await;
+        let stale: Vec<DeviceId> = {
+            let mut st = svc.state.lock().await;
+            let now = Instant::now();
+            let mut stale = Vec::new();
+            for (peer, task) in st.incoming.iter_mut() {
+                let done = task.progress.bytes_done();
+                if done > task.last_progress_bytes {
+                    // 有进展，刷新活跃时间
+                    task.last_progress_bytes = done;
+                    task.last_active_at = now;
+                } else if now.duration_since(task.last_active_at) > RECV_TASK_IDLE_TIMEOUT {
+                    stale.push(peer.clone());
+                }
+            }
+            stale
+        };
+        for peer in stale {
+            warn!("recv: sweeping stale receive task from {peer} (no progress)");
+            svc.abort_incoming(&peer).await;
+        }
+    }
 }
 
 async fn drain_inbound(mut rx: mpsc::Receiver<lanclip_network::InFrame>) {
@@ -648,6 +769,7 @@ mod tests {
                 parallelism: 3,
                 auto_accept: true,
             },
+            None,
         );
         let b_svc = TransferService::spawn(
             b_id.clone(),
@@ -658,6 +780,7 @@ mod tests {
                 parallelism: 3,
                 auto_accept: true,
             },
+            None,
         );
         let _ = a_svc; // 仅 b 接收
 

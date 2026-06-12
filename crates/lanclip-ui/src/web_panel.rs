@@ -32,6 +32,8 @@ pub enum PanelAction {
     PreviewRequest(String),
     OpenControl,
     Quit,
+    /// 搜索：空串表示展示全部历史。后端用 SQLite 全文检索返回完整结果。
+    Search(String),
 }
 
 #[derive(Clone)]
@@ -165,14 +167,30 @@ impl WebPanel {
     }
 
     pub fn set_entries(&mut self, entries: Vec<PanelEntry>) {
+        // 常规刷新：以最新列表为准重建预览缓存（保持有界）。
         self.previews = entries
             .iter()
             .map(|entry| (entry.hash.clone(), entry.preview.clone()))
             .collect();
+        self.push_entries(&entries, "window.lanclipSetEntries");
+    }
+
+    /// 用后端搜索结果刷新列表（已由 SQLite 过滤，前端直接渲染）。
+    pub fn set_search_results(&mut self, entries: Vec<PanelEntry>) {
+        // 搜索结果可能含未在主列表里的旧条目，合并进预览缓存以便 hover 预览。
+        for entry in &entries {
+            self.previews
+                .entry(entry.hash.clone())
+                .or_insert_with(|| entry.preview.clone());
+        }
+        self.push_entries(&entries, "window.lanclipSetSearchResults");
+    }
+
+    fn push_entries(&mut self, entries: &[PanelEntry], js_fn: &str) {
         let js_entries: Vec<JsEntry> = entries.iter().map(JsEntry::from).collect();
         match serde_json::to_string(&js_entries) {
             Ok(json) => {
-                let script = format!("window.lanclipSetEntries({json});");
+                let script = format!("{js_fn}({json});");
                 if let Err(e) = self.webview.evaluate_script(&script) {
                     warn!("panel update failed: {e}");
                 }
@@ -274,6 +292,12 @@ fn parse_panel_action(body: &str) -> Option<PanelAction> {
             .get("hash")
             .and_then(|h| h.as_str())
             .map(|h| PanelAction::PreviewRequest(h.to_string())),
+        "search" => Some(PanelAction::Search(
+            v.get("query")
+                .and_then(|q| q.as_str())
+                .unwrap_or("")
+                .to_string(),
+        )),
         _ => None,
     }
 }
@@ -442,19 +466,12 @@ fn panel_html() -> String {
       display: grid;
       grid-template-rows: 44px 1fr;
       overflow: hidden;
-      border: 1px solid rgba(255, 255, 255, .78);
+      border: 1px solid rgba(255, 255, 255, .52);
       border-radius: 18px;
-      background:
-        radial-gradient(circle at 18% -18%, rgba(255, 255, 255, .80), transparent 34%),
-        radial-gradient(circle at 88% 16%, rgba(255, 255, 255, .42), transparent 30%),
-        linear-gradient(145deg, rgba(255, 255, 255, .86), rgba(247, 250, 253, .80) 46%, rgba(238, 245, 250, .76)),
-        rgba(247, 250, 253, .82);
-      box-shadow:
-        inset 0 1px 0 rgba(255, 255, 255, .90),
-        inset 0 -1px 0 rgba(255, 255, 255, .42),
-        0 12px 26px rgba(20, 29, 39, .13);
-      backdrop-filter: blur(30px) saturate(1.22) brightness(1.02) contrast(1.01);
-      -webkit-backdrop-filter: blur(30px) saturate(1.22) brightness(1.02) contrast(1.01);
+      background: rgba(242, 243, 245, .78);
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, .80);
+      backdrop-filter: blur(20px) saturate(1.6);
+      -webkit-backdrop-filter: blur(20px) saturate(1.6);
     }
     .top {
       display: grid;
@@ -531,14 +548,14 @@ fn panel_html() -> String {
       padding: 5px;
     }
     .item {
-      height: 42px;
+      height: 44px;
       display: grid;
-      grid-template-columns: 22px 1fr;
-      grid-template-rows: 17px 15px;
+      grid-template-columns: 28px 1fr;
+      grid-template-rows: 18px 15px;
       grid-template-areas: "icon title" "icon subtitle";
-      column-gap: 8px;
+      column-gap: 9px;
       align-content: center;
-      padding: 0 10px;
+      padding: 0 8px;
       border-radius: 6px;
       cursor: default;
     }
@@ -550,16 +567,29 @@ fn panel_html() -> String {
     .kind-icon {
       grid-area: icon;
       align-self: center;
-      width: 20px;
-      height: 20px;
+      width: 28px;
+      height: 28px;
       display: grid;
       place-items: center;
-      border-radius: 5px;
-      background: rgba(255, 255, 255, .58);
-      box-shadow: inset 0 1px 0 rgba(255, 255, 255, .68);
-      color: rgba(24, 29, 34, .72);
+      border-radius: 7px;
+      background: rgba(180, 185, 195, .38);
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, .60), 0 1px 2px rgba(0,0,0,.06);
+      color: rgba(50, 55, 65, .75);
       font-size: 12px;
       line-height: 1;
+      overflow: hidden;
+    }
+    .kind-icon img.thumb {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      border-radius: 7px;
+      display: block;
+    }
+    .kind-icon svg {
+      width: 14px;
+      height: 14px;
+      flex-shrink: 0;
     }
     .item.active .kind-icon {
       background: rgba(255, 255, 255, .16);
@@ -585,7 +615,7 @@ fn panel_html() -> String {
       color: rgba(40, 47, 53, .78);
     }
     .item.active .subtitle { color: rgba(255, 255, 255, .78); }
-    .bubble {
+      .bubble {
       position: absolute;
       left: 410px;
       top: 54px;
@@ -594,19 +624,15 @@ fn panel_html() -> String {
       display: none;
       padding: 11px 13px;
       overflow: auto;
-      border: 1px solid rgba(255, 255, 255, .80);
+      border: 1px solid rgba(255, 255, 255, .52);
       border-radius: 20px;
-      background:
-        radial-gradient(circle at 14% -8%, rgba(255, 255, 255, .80), transparent 34%),
-        radial-gradient(circle at 90% 18%, rgba(255, 255, 255, .42), transparent 34%),
-        linear-gradient(145deg, rgba(255, 255, 255, .88), rgba(248, 251, 253, .82) 48%, rgba(241, 247, 251, .78)),
-        rgba(248, 251, 253, .84);
+      background: rgba(242, 243, 245, .78);
       box-shadow:
-        inset 0 1px 0 rgba(255, 255, 255, .92),
-        inset 0 -1px 0 rgba(255, 255, 255, .44),
-        0 12px 28px rgba(20, 29, 39, .14);
-      backdrop-filter: blur(32px) saturate(1.24) brightness(1.02) contrast(1.01);
-      -webkit-backdrop-filter: blur(32px) saturate(1.24) brightness(1.02) contrast(1.01);
+        inset 0 1px 0 rgba(255, 255, 255, .80),
+        0 8px 32px rgba(20, 29, 39, .22),
+        0 2px 8px rgba(20, 29, 39, .12);
+      backdrop-filter: blur(20px) saturate(1.6);
+      -webkit-backdrop-filter: blur(20px) saturate(1.6);
       pointer-events: none;
       cursor: default;
       visibility: hidden;
@@ -658,11 +684,10 @@ fn panel_html() -> String {
     }
     @media (prefers-color-scheme: dark) {
       .menu {
-        border-color: rgba(255, 255, 255, .16);
-        background:
-          radial-gradient(circle at 20% -8%, rgba(255, 255, 255, .18), transparent 40%),
-          linear-gradient(145deg, rgba(255, 255, 255, .10), rgba(255, 255, 255, .025)),
-          rgba(18, 20, 22, .13);
+        border-color: rgba(255, 255, 255, .14);
+        background: rgba(30, 32, 36, .72);
+        backdrop-filter: blur(20px) saturate(1.8);
+        -webkit-backdrop-filter: blur(20px) saturate(1.8);
       }
       .top { border-color: rgba(255, 255, 255, .08); }
       #q, button {
@@ -672,10 +697,9 @@ fn panel_html() -> String {
       }
       .bubble {
         border-color: rgba(255, 255, 255, .10);
-        background:
-          radial-gradient(circle at 16% 0%, rgba(255, 255, 255, .16), transparent 40%),
-          linear-gradient(145deg, rgba(255, 255, 255, .10), rgba(255, 255, 255, .02)),
-          rgba(16, 18, 20, .16);
+        background: rgba(30, 32, 36, .72);
+        backdrop-filter: blur(20px) saturate(1.8);
+        -webkit-backdrop-filter: blur(20px) saturate(1.8);
       }
       .title { color: #f4f4f0; }
       .subtitle, .meta, .empty { color: #aaa9a2; }
@@ -711,6 +735,38 @@ fn panel_html() -> String {
     let hovering = false;
     let previewHash = null;
     let hideTimer = null;
+
+    // SVG icons for list items
+    const ICON_TEXT = `<svg viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round">
+      <path d="M2.5 3.5h9M2.5 6.5h9M2.5 9.5h6"/>
+    </svg>`;
+    const ICON_IMAGE = `<svg viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+      <rect x="1.5" y="1.5" width="11" height="11" rx="2"/>
+      <circle cx="4.5" cy="4.5" r="1"/>
+      <path d="M1.5 9.5l3-3 2.5 2.5 2-2 3 3"/>
+    </svg>`;
+    const ICON_FILE = `<svg viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M3 1.5h5l2.5 2.5V12.5a.5.5 0 0 1-.5.5H3a.5.5 0 0 1-.5-.5v-11A.5.5 0 0 1 3 1.5z"/>
+      <path d="M8 1.5V4h2.5"/>
+    </svg>`;
+
+    function makeKindIcon(entry) {
+      const div = document.createElement('div');
+      div.className = 'kind-icon';
+      if (entry.kind === 'image' && entry._thumbSrc) {
+        const img = document.createElement('img');
+        img.className = 'thumb';
+        img.src = entry._thumbSrc;
+        div.appendChild(img);
+      } else if (entry.kind === 'image') {
+        div.innerHTML = ICON_IMAGE;
+      } else if (entry.kind === 'files') {
+        div.innerHTML = ICON_FILE;
+      } else {
+        div.innerHTML = ICON_TEXT;
+      }
+      return div;
+    }
 
     function post(message) {
       if (window.ipc && window.ipc.postMessage) window.ipc.postMessage(JSON.stringify(message));
@@ -752,10 +808,16 @@ fn panel_html() -> String {
       filtered.forEach((entry, index) => {
         const row = document.createElement('div');
         row.className = 'item' + (index === active ? ' active' : '');
-        row.innerHTML = '<div class="kind-icon"></div><div class="title"></div><div class="subtitle"></div>';
-        row.children[0].textContent = entry.kind === 'image' ? '▧' : (entry.kind === 'files' ? '⌘' : 'T');
-        row.children[1].textContent = entry.title;
-        row.children[2].textContent = entry.subtitle;
+        const iconEl = makeKindIcon(entry);
+        const titleEl = document.createElement('div');
+        titleEl.className = 'title';
+        titleEl.textContent = entry.title;
+        const subtitleEl = document.createElement('div');
+        subtitleEl.className = 'subtitle';
+        subtitleEl.textContent = entry.subtitle;
+        row.appendChild(iconEl);
+        row.appendChild(titleEl);
+        row.appendChild(subtitleEl);
         row.addEventListener('mouseenter', () => {
           clearPendingHide();
           hovering = true;
@@ -793,7 +855,30 @@ fn panel_html() -> String {
     }
 
     function renderPreview(payload) {
-      if (!payload || payload.hash !== previewHash) return;
+      if (!payload) return;
+      // Update thumbnail cache for image entries
+      if (payload.kind === 'image' && payload.imageSrc) {
+        const entry = entries.find(e => e.hash === payload.hash);
+        if (entry && !entry._thumbSrc) {
+          entry._thumbSrc = payload.imageSrc;
+          // Update icon in rendered list if visible
+          const idx = filtered.findIndex(e => e.hash === payload.hash);
+          if (idx >= 0) {
+            const rows = list.querySelectorAll('.item');
+            if (rows[idx]) {
+              const iconEl = rows[idx].querySelector('.kind-icon');
+              if (iconEl && !iconEl.querySelector('img.thumb')) {
+                const img = document.createElement('img');
+                img.className = 'thumb';
+                img.src = payload.imageSrc;
+                iconEl.innerHTML = '';
+                iconEl.appendChild(img);
+              }
+            }
+          }
+        }
+      }
+      if (payload.hash !== previewHash) return;
       bubble.textContent = '';
       bubble.style.width = payload.kind === 'image' ? '340px' : 'max-content';
       bubble.style.maxWidth = '340px';
@@ -849,12 +934,19 @@ fn panel_html() -> String {
       bubble.style.top = `${top}px`;
     }
 
+    // 本地即时过滤（已加载条目），同时把查询发给后端做 SQLite 全文检索补全历史。
     const debouncedFilter = debounce(() => {
       active = 0;
       hidePreview();
       applyFilter();
     }, 35);
-    q.addEventListener('input', debouncedFilter);
+    const debouncedServerSearch = debounce(() => {
+      post({ type: 'search', query: q.value.trim() });
+    }, 140);
+    q.addEventListener('input', () => {
+      debouncedFilter();
+      debouncedServerSearch();
+    });
     q.addEventListener('keydown', (event) => {
       if (event.key === 'Escape') {
         post({ type: 'hide' });
@@ -887,8 +979,29 @@ fn panel_html() -> String {
 
     window.lanclipSetEntries = (nextEntries) => {
       entries = Array.isArray(nextEntries) ? nextEntries : [];
+      // Reset thumbnails on new entry set
+      entries.forEach(e => { e._thumbSrc = null; e._thumbRequested = false; });
       active = 0;
       applyFilter();
+      // Pre-request thumbnails for image entries (first 12)
+      entries.filter(e => e.kind === 'image').slice(0, 12).forEach(e => {
+        e._thumbRequested = true;
+        post({ type: 'preview_request', hash: e.hash });
+      });
+    };
+    // Server-side search results: already filtered by backend (SQLite full-text),
+    // so render them directly without re-applying the local needle filter.
+    window.lanclipSetSearchResults = (nextEntries) => {
+      const next = Array.isArray(nextEntries) ? nextEntries : [];
+      next.forEach(e => { e._thumbSrc = null; e._thumbRequested = false; });
+      entries = next;
+      filtered = next.slice();
+      active = 0;
+      render();
+      next.filter(e => e.kind === 'image').slice(0, 12).forEach(e => {
+        e._thumbRequested = true;
+        post({ type: 'preview_request', hash: e.hash });
+      });
     };
     window.lanclipSetPreview = renderPreview;
     window.lanclipFocusSearch = () => {

@@ -7,6 +7,9 @@
 //! 控制连接上的 `TransferOffer / Accept / Done / Cancel / Progress` 由 app 层处理；
 //! 本 crate 只负责数据通道的并发执行。
 
+// TransferError 透传了较大的 `NetError`（内含 tungstenite::Error），large-err 提示可忽略。
+#![allow(clippy::result_large_err)]
+
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;

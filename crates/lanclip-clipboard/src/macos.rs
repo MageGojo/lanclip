@@ -200,7 +200,7 @@ fn read_files(pb: &NSPasteboard) -> Option<ClipboardPayload> {
     }
 
     let url: Option<Retained<NSString>> =
-        unsafe { objc2::msg_send![&*pb, stringForType: &*type_str] };
+        unsafe { objc2::msg_send![pb, stringForType: &*type_str] };
     let path = file_url_to_path(&url?.to_string())?;
     let entry = file_entry_for_path(&path);
     Some(ClipboardPayload::FileRefs {
@@ -295,7 +295,7 @@ fn file_entry_for_path(path: &Path) -> FileClipboardEntry {
 fn read_text(pb: &NSPasteboard) -> Option<ClipboardPayload> {
     let type_str = NSString::from_str(TYPE_TEXT);
     let text: Option<Retained<NSString>> =
-        unsafe { objc2::msg_send![&*pb, stringForType: &*type_str] };
+        unsafe { objc2::msg_send![pb, stringForType: &*type_str] };
     let plain = text.map(|s| s.to_string()).filter(|s| !s.is_empty())?;
 
     // 尝试读取 RTF
@@ -304,7 +304,7 @@ fn read_text(pb: &NSPasteboard) -> Option<ClipboardPayload> {
     // 尝试读取 HTML
     let html_type = NSString::from_str(TYPE_HTML);
     let html_ns: Option<Retained<NSString>> =
-        unsafe { objc2::msg_send![&*pb, stringForType: &*html_type] };
+        unsafe { objc2::msg_send![pb, stringForType: &*html_type] };
     let html = html_ns.map(|s| s.to_string()).filter(|s| !s.is_empty());
 
     Some(ClipboardPayload::Text { plain, rtf, html })
@@ -313,7 +313,7 @@ fn read_text(pb: &NSPasteboard) -> Option<ClipboardPayload> {
 /// 从 pasteboard 读取指定 UTI 类型的原始数据。
 fn read_data_for_type(pb: &NSPasteboard, uti: &str) -> Option<Retained<NSData>> {
     let type_str = NSString::from_str(uti);
-    let data: Option<Retained<NSData>> = unsafe { objc2::msg_send![&*pb, dataForType: &*type_str] };
+    let data: Option<Retained<NSData>> = unsafe { objc2::msg_send![pb, dataForType: &*type_str] };
     data.filter(|d| unsafe { nsdata_bytes(d).len() } > 0)
 }
 
@@ -321,7 +321,7 @@ fn read_image(pb: &NSPasteboard) -> Option<ClipboardPayload> {
     // 优先尝试 PNG（无损、体积小）
     let png_type = NSString::from_str(TYPE_PNG);
     let png_data: Option<Retained<NSData>> =
-        unsafe { objc2::msg_send![&*pb, dataForType: &*png_type] };
+        unsafe { objc2::msg_send![pb, dataForType: &*png_type] };
     if let Some(ref data) = png_data {
         let bytes = unsafe { nsdata_bytes(data) };
         if !bytes.is_empty() {
@@ -338,7 +338,7 @@ fn read_image(pb: &NSPasteboard) -> Option<ClipboardPayload> {
     // 退而求其次：TIFF → 转 PNG
     let tiff_type = NSString::from_str(TYPE_TIFF);
     let tiff_data: Option<Retained<NSData>> =
-        unsafe { objc2::msg_send![&*pb, dataForType: &*tiff_type] };
+        unsafe { objc2::msg_send![pb, dataForType: &*tiff_type] };
     if let Some(ref data) = tiff_data {
         let bytes = unsafe { nsdata_bytes(data) };
         if !bytes.is_empty() {

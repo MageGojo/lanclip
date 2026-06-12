@@ -19,6 +19,12 @@ use uuid::Uuid;
 #[derive(Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct DeviceId(pub String);
 
+impl Default for DeviceId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DeviceId {
     pub fn new() -> Self {
         Self(Uuid::new_v4().to_string())

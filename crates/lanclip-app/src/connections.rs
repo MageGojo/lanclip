@@ -9,6 +9,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use lanclip_domain::DeviceId;
 use lanclip_network::{dial, handshake, ConnHandle, InFrame, NetError, RawServerWs, WsListener};
@@ -16,6 +17,12 @@ use lanclip_proto::{ConnRole, DevicePublic, Msg, PROTOCOL_VERSION, WS_PATH_CONTR
 use thiserror::Error;
 use tokio::sync::{broadcast, mpsc, Mutex};
 use tracing::{debug, info, warn};
+
+/// 应用层心跳间隔：每隔这么久向所有控制连接发一次 Ping。
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
+
+/// 控制连接静默超时：超过这么久没收到任何帧（含 Pong）则判定断开并清理。
+const CONTROL_IDLE_TIMEOUT: Duration = Duration::from_secs(45);
 
 // ============================================================================
 // 错误
@@ -81,12 +88,24 @@ struct ConnState {
     peers: HashMap<DeviceId, PeerEntry>,
 }
 
-#[derive(Default)]
 struct PeerEntry {
     control: Option<ConnHandle>,
     addrs: Vec<SocketAddr>,
     /// 是否正在 dial 控制连接，避免重复发起。
     control_dialing: bool,
+    /// 控制连接上最近一次收到帧的时间（用于心跳超时判定）。
+    last_seen: Instant,
+}
+
+impl Default for PeerEntry {
+    fn default() -> Self {
+        Self {
+            control: None,
+            addrs: Vec::new(),
+            control_dialing: false,
+            last_seen: Instant::now(),
+        }
+    }
 }
 
 impl ConnectionManager {
@@ -122,6 +141,52 @@ impl ConnectionManager {
     // ------------------------------------------------------------------------
     // 监听 & 入站处理
     // ------------------------------------------------------------------------
+
+    /// 启动应用层心跳（spawn 常驻 task）：定期向所有控制连接发 Ping，
+    /// 并断开长时间静默（无任何帧）的连接，及时回收半开连接。
+    pub fn start_heartbeat(self: &Arc<Self>) {
+        let mgr = self.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(HEARTBEAT_INTERVAL);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                mgr.heartbeat_tick().await;
+            }
+        });
+    }
+
+    /// 单次心跳：对每个有控制连接的 peer，超时则断开，否则发 Ping。
+    async fn heartbeat_tick(self: &Arc<Self>) {
+        let now = Instant::now();
+        let (to_ping, to_drop): (Vec<(DeviceId, ConnHandle)>, Vec<DeviceId>) = {
+            let st = self.state.lock().await;
+            let mut ping = Vec::new();
+            let mut drop_list = Vec::new();
+            for (id, entry) in st.peers.iter() {
+                if let Some(handle) = &entry.control {
+                    if now.duration_since(entry.last_seen) > CONTROL_IDLE_TIMEOUT {
+                        drop_list.push(id.clone());
+                    } else {
+                        ping.push((id.clone(), handle.clone()));
+                    }
+                }
+            }
+            (ping, drop_list)
+        };
+
+        for id in to_drop {
+            warn!("control conn to {id} idle-timed out; dropping");
+            self.drop_peer(&id).await;
+        }
+
+        let ts = now_millis();
+        for (id, handle) in to_ping {
+            if let Err(e) = handle.send_msg(&Msg::Ping { ts }).await {
+                debug!("heartbeat ping to {id} failed: {e}");
+            }
+        }
+    }
 
     /// 启动 accept loop（spawn 一个常驻 task）。listener 被 task 持有。
     pub fn start_listener(self: &Arc<Self>, listener: WsListener) {
@@ -193,7 +258,7 @@ impl ConnectionManager {
     /// 已连接 / 正在建立 → 直接返回。
     pub async fn try_dial_control(self: &Arc<Self>, peer_id: DeviceId, addrs: Vec<SocketAddr>) {
         // 1. tie-break：小 id 不主动
-        if &self.self_id <= &peer_id {
+        if self.self_id <= peer_id {
             debug!("tie-break: self_id <= peer_id, wait for incoming control from {peer_id}");
             // 仍然存一下地址（万一需要主动发数据连接）
             self.update_peer_addrs(&peer_id, addrs).await;
@@ -233,19 +298,12 @@ impl ConnectionManager {
         peer_id: &DeviceId,
         addrs: &[SocketAddr],
     ) -> Result<()> {
-        let addr = *addrs
-            .first()
-            .ok_or_else(|| ConnMgrError::NoAddress(peer_id.clone()))?;
-        let ws = dial(addr, WS_PATH_CONTROL).await?;
-        let self_hello = self.make_hello(ConnRole::Control);
-        let (conn, inbound) = handshake(ws, self_hello).await?;
+        // 依次尝试所有已知地址（多网卡 / IPv6 等），直到一条握手成功。
+        let (conn, inbound) = self
+            .dial_first_working(addrs, WS_PATH_CONTROL, ConnRole::Control)
+            .await
+            .ok_or_else(|| ConnMgrError::NoAddress(peer_id.clone()))??;
 
-        if conn.remote.role != ConnRole::Control {
-            return Err(ConnMgrError::RoleMismatch {
-                path: WS_PATH_CONTROL.into(),
-                role: conn.remote.role,
-            });
-        }
         let remote_id = DeviceId(conn.remote.device.id.clone());
         if &remote_id != peer_id {
             warn!("dialed {peer_id} but handshake returned {remote_id}");
@@ -253,31 +311,63 @@ impl ConnectionManager {
         self.clone().attach_connection(conn, inbound).await
     }
 
-    /// 主动建立一条数据连接（用于发送端）。
+    /// 依次尝试 `addrs` 里的每个地址拨号 + 握手，返回首个成功的连接。
+    ///
+    /// 返回 `None` 表示 `addrs` 为空；`Some(Err)` 表示全部尝试均失败（携带最后一个错误）。
+    async fn dial_first_working(
+        self: &Arc<Self>,
+        addrs: &[SocketAddr],
+        path: &'static str,
+        expect_role: ConnRole,
+    ) -> Option<Result<(ConnHandle, mpsc::Receiver<InFrame>)>> {
+        let mut last_err: Option<ConnMgrError> = None;
+        for addr in addrs {
+            match self.dial_one(*addr, path, expect_role).await {
+                Ok(pair) => return Some(Ok(pair)),
+                Err(e) => {
+                    debug!("dial {addr}{path} failed: {e}; trying next address");
+                    last_err = Some(e);
+                }
+            }
+        }
+        last_err.map(Err)
+    }
+
+    /// 单地址拨号 + 握手 + 角色校验。
+    async fn dial_one(
+        self: &Arc<Self>,
+        addr: SocketAddr,
+        path: &'static str,
+        expect_role: ConnRole,
+    ) -> Result<(ConnHandle, mpsc::Receiver<InFrame>)> {
+        let ws = dial(addr, path).await?;
+        let self_hello = self.make_hello(expect_role);
+        let (conn, inbound) = handshake(ws, self_hello).await?;
+        if conn.remote.role != expect_role {
+            return Err(ConnMgrError::RoleMismatch {
+                path: path.into(),
+                role: conn.remote.role,
+            });
+        }
+        Ok((conn, inbound))
+    }
+
+    /// 主动建立一条数据连接（用于发送端）。依次尝试该 peer 的所有已知地址。
     pub async fn dial_data(
         self: &Arc<Self>,
         peer_id: &DeviceId,
     ) -> Result<(ConnHandle, mpsc::Receiver<InFrame>)> {
-        let addr = {
+        let addrs = {
             let st = self.state.lock().await;
             st.peers
                 .get(peer_id)
-                .and_then(|e| e.addrs.first().copied())
-                .ok_or_else(|| ConnMgrError::NoAddress(peer_id.clone()))?
+                .map(|e| e.addrs.clone())
+                .unwrap_or_default()
         };
 
-        let ws = dial(addr, WS_PATH_DATA).await?;
-        let self_hello = self.make_hello(ConnRole::Data);
-        let (conn, inbound) = handshake(ws, self_hello).await?;
-
-        if conn.remote.role != ConnRole::Data {
-            return Err(ConnMgrError::RoleMismatch {
-                path: WS_PATH_DATA.into(),
-                role: conn.remote.role,
-            });
-        }
-
-        Ok((conn, inbound))
+        self.dial_first_working(&addrs, WS_PATH_DATA, ConnRole::Data)
+            .await
+            .ok_or_else(|| ConnMgrError::NoAddress(peer_id.clone()))?
     }
 
     // ------------------------------------------------------------------------
@@ -298,6 +388,7 @@ impl ConnectionManager {
                 let replaced = {
                     let mut st = self.state.lock().await;
                     let entry = st.peers.entry(peer_id.clone()).or_default();
+                    entry.last_seen = Instant::now();
                     entry.control.replace(conn.clone()).is_some()
                 };
                 if replaced {
@@ -403,6 +494,13 @@ impl ConnectionManager {
     }
 }
 
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 // ============================================================================
 // 控制连接 inbound 转发
 // ============================================================================
@@ -413,7 +511,23 @@ async fn forward_control_inbound(
     mut inbound: mpsc::Receiver<InFrame>,
 ) {
     while let Some(frame) = inbound.recv().await {
+        // 任何帧都刷新活跃时间（心跳超时判定）。
+        {
+            let mut st = mgr.state.lock().await;
+            if let Some(entry) = st.peers.get_mut(&peer_id) {
+                entry.last_seen = Instant::now();
+            }
+        }
         match frame {
+            InFrame::Msg(Msg::Ping { ts }) => {
+                // 应用层心跳：自动回 Pong，不向上层广播。
+                if let Err(e) = mgr.send_control(&peer_id, &Msg::Pong { ts }).await {
+                    debug!("reply pong to {peer_id} failed: {e}");
+                }
+            }
+            InFrame::Msg(Msg::Pong { .. }) => {
+                // 已在上面刷新 last_seen，无需进一步处理。
+            }
             InFrame::Msg(msg) => {
                 let _ = mgr.event_tx.send(ConnEvent::ControlMessage {
                     peer_id: peer_id.clone(),
@@ -496,34 +610,44 @@ mod tests {
             "unexpected b evt: {b_evt:?}"
         );
 
-        // A 发 Ping → B 收到
+        // 注意：Ping/Pong 现为传输层心跳（自动回 Pong、不向上层广播），
+        // 故这里用真实应用消息 ClipboardText 验证 ControlMessage 路由与广播。
+        let clip_msg = |t: &str| Msg::ClipboardText {
+            origin: "x".into(),
+            content_hash: "h".into(),
+            text: t.into(),
+        };
+
+        // A 发消息 → B 收到 ControlMessage
         a_mgr
-            .send_control(&b_id, &Msg::Ping { ts: 42 })
+            .send_control(&b_id, &clip_msg("hello"))
             .await
-            .expect("a send ping");
+            .expect("a send msg");
         let b_evt = timeout(Duration::from_secs(2), b_events.recv())
             .await
-            .expect("b ping timeout")
+            .expect("b msg timeout")
             .expect("b evt closed");
         assert!(
             matches!(
                 &b_evt,
-                ConnEvent::ControlMessage { peer_id, msg: Msg::Ping { ts: 42 } } if peer_id == &a_id
+                ConnEvent::ControlMessage { peer_id, msg: Msg::ClipboardText { text, .. } }
+                    if peer_id == &a_id && text == "hello"
             ),
             "unexpected b evt: {b_evt:?}"
         );
 
-        // B 广播 Pong → A 收到
-        let n = b_mgr.broadcast_control(&Msg::Pong { ts: 42 }).await;
+        // B 广播消息 → A 收到
+        let n = b_mgr.broadcast_control(&clip_msg("world")).await;
         assert_eq!(n, 1, "should broadcast to 1 peer");
         let a_evt = timeout(Duration::from_secs(2), a_events.recv())
             .await
-            .expect("a pong timeout")
+            .expect("a msg timeout")
             .expect("a evt closed");
         assert!(
             matches!(
                 &a_evt,
-                ConnEvent::ControlMessage { peer_id, msg: Msg::Pong { ts: 42 } } if peer_id == &b_id
+                ConnEvent::ControlMessage { peer_id, msg: Msg::ClipboardText { text, .. } }
+                    if peer_id == &b_id && text == "world"
             ),
             "unexpected a evt: {a_evt:?}"
         );

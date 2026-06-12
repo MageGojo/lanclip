@@ -246,6 +246,10 @@ impl ClipboardHistory {
             .len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// 订阅变化版本号；初始值 = 当前版本。
     pub fn subscribe(&self) -> watch::Receiver<u64> {
         self.watch_tx.subscribe()
@@ -277,14 +281,12 @@ fn now_secs() -> u64 {
 /// 按"字符"截断（而不是字节），保证 utf-8 安全。
 fn truncate_chars(s: &str, max_chars: usize) -> String {
     let mut out = String::new();
-    let mut count = 0;
-    for c in s.chars() {
+    for (count, c) in s.chars().enumerate() {
         if count >= max_chars {
             out.push('…');
             break;
         }
         out.push(c);
-        count += 1;
     }
     out
 }

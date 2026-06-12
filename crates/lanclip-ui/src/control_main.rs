@@ -306,6 +306,12 @@ impl ControlApp {
             (false, "offline") => "Offline",
             (true, "confirm") => "确认配对",
             (false, "confirm") => "Confirm",
+            (true, "accept_request") => "对方请求·确认",
+            (false, "accept_request") => "Accept Request",
+            (true, "pair") => "发起配对",
+            (false, "pair") => "Pair",
+            (true, "waiting_confirm") => "等待对方确认",
+            (false, "waiting_confirm") => "Waiting for peer",
             (true, "forget") => "取消信任",
             (false, "forget") => "Forget",
             (true, "clips") => "历史记录",
@@ -815,9 +821,25 @@ impl ControlApp {
         };
         let trust = if peer.trusted {
             self.tr("trusted")
+        } else if peer.incoming_request {
+            self.tr("accept_request")
+        } else if peer.outgoing_pending {
+            self.tr("waiting_confirm")
         } else {
             self.tr("untrusted")
         };
+        // 主按钮文案：对端请求 → 确认；本机已发起 → 等待；其余 → 发起配对。
+        let primary_label = if peer.incoming_request {
+            self.tr("accept_request")
+        } else if peer.outgoing_pending {
+            self.tr("waiting_confirm")
+        } else if peer.trusted {
+            self.tr("confirm")
+        } else {
+            self.tr("pair")
+        };
+        // 高亮：对端请求待确认时最该点；已发起等待中不高亮。
+        let primary_active = peer.incoming_request;
         let peer_confirm = peer.id.clone();
         let peer_cancel = peer.id.clone();
         div()
@@ -862,8 +884,8 @@ impl ControlApp {
                     .gap_2()
                     .child(small_button(
                         "confirm_peer",
-                        self.tr("confirm"),
-                        peer.trusted,
+                        primary_label,
+                        primary_active,
                         cx,
                         move |this, cx| this.confirm_peer(peer_confirm.clone(), cx),
                     ))
@@ -1414,6 +1436,7 @@ fn setting_toggle(
         )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn shortcut_setting(
     label: &str,
     detail: &str,

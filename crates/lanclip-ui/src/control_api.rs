@@ -7,7 +7,9 @@ use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::hotkey_config;
-use lanclip_app::{AppConfig, ClipboardHistory, ConnectionManager, HistoryEntry, Msg};
+use lanclip_app::{
+    pair_code, AppConfig, ClipboardHistory, ConnectionManager, HistoryEntry, Msg, PairingManager,
+};
 use lanclip_domain::{ClipboardPayload, DeviceId};
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Handle;
@@ -55,6 +57,10 @@ pub struct ControlPeerDto {
     pub connected: bool,
     pub trusted: bool,
     pub code: String,
+    /// 对端已发来配对请求、等待本机确认（UI 应高亮"确认配对"）。
+    pub incoming_request: bool,
+    /// 本机已发起配对、等待对端确认（UI 显示"等待对方确认"）。
+    pub outgoing_pending: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -87,12 +93,14 @@ pub struct PeerPatchDto {
     pub peer_id: String,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn start_control_server(
     self_id: DeviceId,
     lan_port: u16,
     config: Arc<RwLock<AppConfig>>,
     history: Arc<ClipboardHistory>,
     conn_mgr: Arc<ConnectionManager>,
+    pairing: PairingManager,
     rt: Handle,
     runtime_notify: Option<RuntimeNotify>,
 ) -> anyhow::Result<ControlEndpoint> {
@@ -114,6 +122,7 @@ pub fn start_control_server(
                         &config,
                         &history,
                         &conn_mgr,
+                        &pairing,
                         &rt,
                         runtime_notify.as_ref(),
                     ),
@@ -138,6 +147,7 @@ fn make_token(self_id: &DeviceId) -> String {
         .to_string()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_stream(
     mut stream: TcpStream,
     token: &str,
@@ -146,6 +156,7 @@ fn handle_stream(
     config: &Arc<RwLock<AppConfig>>,
     history: &Arc<ClipboardHistory>,
     conn_mgr: &Arc<ConnectionManager>,
+    pairing: &PairingManager,
     rt: &Handle,
     runtime_notify: Option<&RuntimeNotify>,
 ) {
@@ -178,7 +189,7 @@ fn handle_stream(
 
     match (parts[0], parts[1]) {
         ("GET", "/state") | ("GET", "/history") => {
-            let state = build_state(config, self_id, lan_port, history, conn_mgr, rt);
+            let state = build_state(config, self_id, lan_port, history, conn_mgr, pairing, rt);
             write_json(&mut stream, 200, &state);
         }
         ("POST", "/settings") => match serde_json::from_str::<SettingsPatchDto>(body) {
@@ -235,7 +246,7 @@ fn handle_stream(
                         notify(ControlRuntimeEvent::MenuHotkeyChanged);
                     }
                 }
-                let state = build_state(config, self_id, lan_port, history, conn_mgr, rt);
+                let state = build_state(config, self_id, lan_port, history, conn_mgr, pairing, rt);
                 write_json(&mut stream, 200, &state);
             }
             Err(_) => write_response(&mut stream, 400, "bad json"),
@@ -245,11 +256,11 @@ fn handle_stream(
                 Ok(peer) => {
                     let peer_id = DeviceId(peer.peer_id);
                     if parts[1].ends_with("confirm") {
-                        confirm_peer(config, conn_mgr, rt, self_id, peer_id);
+                        confirm_peer(config, conn_mgr, pairing, rt, self_id, peer_id);
                     } else {
-                        cancel_peer(config, conn_mgr, rt, self_id, peer_id);
+                        cancel_peer(config, conn_mgr, pairing, rt, self_id, peer_id);
                     }
-                    let state = build_state(config, self_id, lan_port, history, conn_mgr, rt);
+                    let state = build_state(config, self_id, lan_port, history, conn_mgr, pairing, rt);
                     write_json(&mut stream, 200, &state);
                 }
                 Err(_) => write_response(&mut stream, 400, "bad json"),
@@ -259,31 +270,52 @@ fn handle_stream(
     }
 }
 
+/// 用户在控制台点"配对/确认"。两种情形：
+/// - 若本机此前收到过该 peer 的 `PairRequest`（incoming pending）→ 我们是 **响应方**：
+///   消费该 pending、写信任、向对端回 `PairConfirm`（对端校验其 outgoing pending 后写信任）。
+/// - 否则 → 我们是 **发起方**：记 outgoing pending、向对端发 `PairRequest`（等对端用户确认）。
+///   此时本机 **尚不** 写信任，直到收到对端合法的 `PairConfirm`。
 fn confirm_peer(
     config: &Arc<RwLock<AppConfig>>,
     conn_mgr: &Arc<ConnectionManager>,
+    pairing: &PairingManager,
     rt: &Handle,
     self_id: &DeviceId,
     peer_id: DeviceId,
 ) {
     let code = pair_code(self_id, &peer_id);
-    rt.block_on(async {
-        let mut cfg = config.write().await;
-        if !cfg.trusted_peers.iter().any(|id| id == &peer_id) {
-            cfg.trusted_peers.push(peer_id.clone());
+    let responding = pairing.consume_incoming(&peer_id);
+
+    let msg = if responding {
+        // 响应对端请求：写信任 + 回 confirm
+        let cfg = config.clone();
+        let pid = peer_id.clone();
+        rt.block_on(async move {
+            let mut cfg = cfg.write().await;
+            if !cfg.trusted_peers.iter().any(|id| id == &pid) {
+                cfg.trusted_peers.push(pid.clone());
+            }
+            if let Err(e) = cfg.save() {
+                warn!("save trusted peer failed: {e}");
+            }
+        });
+        Msg::PairConfirm {
+            origin: self_id.0.clone(),
+            code,
         }
-        if let Err(e) = cfg.save() {
-            warn!("save trusted peer failed: {e}");
+    } else {
+        // 主动发起：仅记 outgoing pending，等对端确认
+        pairing.begin_outgoing(&peer_id);
+        Msg::PairRequest {
+            origin: self_id.0.clone(),
+            code,
         }
-    });
-    let msg = Msg::PairConfirm {
-        origin: self_id.0.clone(),
-        code,
     };
+
     let mgr = conn_mgr.clone();
     rt.spawn(async move {
         if let Err(e) = mgr.send_control(&peer_id, &msg).await {
-            warn!("pair confirm failed: {e}");
+            warn!("pair message send failed: {e}");
         }
     });
 }
@@ -291,10 +323,12 @@ fn confirm_peer(
 fn cancel_peer(
     config: &Arc<RwLock<AppConfig>>,
     conn_mgr: &Arc<ConnectionManager>,
+    pairing: &PairingManager,
     rt: &Handle,
     self_id: &DeviceId,
     peer_id: DeviceId,
 ) {
+    pairing.cancel(&peer_id);
     rt.block_on(async {
         let mut cfg = config.write().await;
         cfg.trusted_peers.retain(|id| id != &peer_id);
@@ -319,16 +353,21 @@ fn build_state(
     lan_port: u16,
     history: &Arc<ClipboardHistory>,
     conn_mgr: &Arc<ConnectionManager>,
+    pairing: &PairingManager,
     rt: &Handle,
 ) -> ControlStateDto {
     let cfg = rt.block_on(async { config.read().await.clone() });
     let connected = rt.block_on(async { conn_mgr.connected_peers().await });
+    let incoming = pairing.pending_incoming();
+    let outgoing = pairing.pending_outgoing();
     let mut peers: Vec<ControlPeerDto> = connected
         .into_iter()
         .map(|id| ControlPeerDto {
             trusted: cfg.trusted_peers.iter().any(|trusted| trusted == &id),
             code: pair_code(self_id, &id),
             short_id: short_hash(id.as_str()),
+            incoming_request: incoming.contains(&id),
+            outgoing_pending: outgoing.contains(&id),
             id: id.0,
             connected: true,
         })
@@ -341,6 +380,8 @@ fn build_state(
                 connected: false,
                 trusted: true,
                 code: pair_code(self_id, id),
+                incoming_request: incoming.contains(id),
+                outgoing_pending: outgoing.contains(id),
             });
         }
     }
@@ -504,22 +545,6 @@ fn history_item(entry: HistoryEntry) -> HistoryItemDto {
     }
 }
 
-pub fn pair_code(a: &DeviceId, b: &DeviceId) -> String {
-    let (left, right) = if a <= b {
-        (a.as_str(), b.as_str())
-    } else {
-        (b.as_str(), a.as_str())
-    };
-    let digest = blake3::hash(format!("lanclip-pair:{left}:{right}").as_bytes());
-    let n = u32::from_be_bytes([
-        digest.as_bytes()[0],
-        digest.as_bytes()[1],
-        digest.as_bytes()[2],
-        digest.as_bytes()[3],
-    ]) % 1_000_000;
-    format!("{n:06}")
-}
-
 pub fn short_hash(s: &str) -> String {
     s.chars().take(8).collect()
 }
@@ -571,7 +596,7 @@ fn write_response_with_type(stream: &mut TcpStream, code: u16, content_type: &st
     };
     let response = format!(
         "HTTP/1.1 {code} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.as_bytes().len()
+        body.len()
     );
     let _ = stream.write_all(response.as_bytes());
 }
@@ -623,7 +648,7 @@ pub mod client {
         let body = body.unwrap_or("");
         let request = format!(
             "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nX-Lanclip-Token: {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.as_bytes().len()
+            body.len()
         );
         stream.write_all(request.as_bytes())?;
         let mut response = String::new();

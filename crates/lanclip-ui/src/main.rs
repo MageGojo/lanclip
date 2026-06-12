@@ -40,6 +40,7 @@ fn main() -> anyhow::Result<()> {
     let clipboard = app.clipboard.clone();
     let config = app.config.clone();
     let conn_mgr = app.conn_mgr.clone();
+    let pairing = app.pairing.clone();
     let self_id = app.self_id.clone();
     let port = app.listener_port;
     let _app = Mutex::new(Some(app));
@@ -69,6 +70,7 @@ fn main() -> anyhow::Result<()> {
         config.clone(),
         history.clone(),
         conn_mgr,
+        pairing,
         rt_h.clone(),
         Some(control_notify),
     )?;
@@ -120,7 +122,7 @@ fn main() -> anyhow::Result<()> {
                 }
                 #[cfg(target_os = "macos")]
                 {
-                    objc2_core_foundation::CFRunLoop::main().map(|r| r.wake_up());
+                    if let Some(r) = objc2_core_foundation::CFRunLoop::main() { r.wake_up() }
                 }
             }
 
@@ -133,10 +135,10 @@ fn main() -> anyhow::Result<()> {
 
             Event::UserEvent(UserEvent::Tray(TrayIconEvent::Click {
                 rect,
-                button,
+                button: MouseButton::Left | MouseButton::Right,
                 button_state: MouseButtonState::Up,
                 ..
-            })) if matches!(button, MouseButton::Left | MouseButton::Right) => {
+            })) => {
                 let anchor = Some((
                     rect.position.x,
                     rect.position.y,
@@ -172,6 +174,10 @@ fn main() -> anyhow::Result<()> {
                 PanelAction::Hide => panel.hide(),
                 PanelAction::PreviewVisible(visible) => panel.set_preview_expanded(visible),
                 PanelAction::PreviewRequest(hash) => panel.send_preview(&hash),
+                PanelAction::Search(query) => {
+                    let results = search_panel_entries(&history, &query);
+                    panel.set_search_results(results);
+                }
                 PanelAction::OpenControl => {
                     panel.hide();
                     launch_control_panel(&control_endpoint, &mut control_child)
@@ -184,11 +190,10 @@ fn main() -> anyhow::Result<()> {
             },
 
             Event::WindowEvent {
-                window_id, event, ..
-            } if window_id == panel.window_id() => match event {
-                WindowEvent::CloseRequested | WindowEvent::Focused(false) => panel.hide(),
-                _ => {}
-            },
+                window_id,
+                event: WindowEvent::CloseRequested | WindowEvent::Focused(false),
+                ..
+            } if window_id == panel.window_id() => panel.hide(),
 
             _ => {}
         }
@@ -271,6 +276,19 @@ fn toggle_panel(
 fn build_panel_entries(history: &ClipboardHistory) -> Vec<PanelEntry> {
     history
         .snapshot()
+        .into_iter()
+        .take(80)
+        .map(panel_entry_for_web_panel)
+        .collect()
+}
+
+/// 后端搜索：空查询回退到最近列表；否则走 `ClipboardHistory::search`（SQLite 全文）。
+fn search_panel_entries(history: &ClipboardHistory, query: &str) -> Vec<PanelEntry> {
+    if query.is_empty() {
+        return build_panel_entries(history);
+    }
+    history
+        .search(query)
         .into_iter()
         .take(80)
         .map(panel_entry_for_web_panel)

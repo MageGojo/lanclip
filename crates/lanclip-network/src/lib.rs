@@ -5,7 +5,11 @@
 //! - 握手第一帧固定为 `Msg::Hello`，含 `role` (control/data) 和对端 `DevicePublic`。
 //! - 不在这一层做连接池 / tie-break / 业务调度，那是 app 层的事。
 
+// NetError 合理地包裹了体积较大的 `tungstenite::Error`，此处的 large-err 提示可忽略。
+#![allow(clippy::result_large_err)]
+
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
@@ -17,6 +21,12 @@ use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::{accept_async, connect_async, WebSocketStream};
 use tracing::{debug, info, warn};
+
+/// 握手阶段（等待对端 Hello）最长等待时间，防止慢速/恶意连接长期占用 task。
+pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// WS 升级（accept / connect）最长等待时间。
+pub const WS_UPGRADE_TIMEOUT: Duration = Duration::from_secs(10);
 
 // ============================================================================
 // 错误
@@ -41,6 +51,9 @@ pub enum NetError {
 
     #[error("connection closed before handshake")]
     Closed,
+
+    #[error("handshake timed out")]
+    Timeout,
 }
 
 pub type Result<T> = std::result::Result<T, NetError>;
@@ -147,7 +160,9 @@ impl WsListener {
     /// 接受一条新连接并完成 WS 升级。
     pub async fn accept_one(&self) -> Result<(WebSocketStream<TcpStream>, SocketAddr)> {
         let (tcp, peer) = self.listener.accept().await?;
-        let ws = accept_async(tcp).await?;
+        let ws = tokio::time::timeout(WS_UPGRADE_TIMEOUT, accept_async(tcp))
+            .await
+            .map_err(|_| NetError::Timeout)??;
         debug!("ws accepted from {peer}");
         Ok((ws, peer))
     }
@@ -159,7 +174,7 @@ impl WsListener {
         let (tcp, peer) = self.listener.accept().await?;
         let path = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
         let path_for_cb = path.clone();
-        let ws = tokio_tungstenite::accept_hdr_async(
+        let upgrade = tokio_tungstenite::accept_hdr_async(
             tcp,
             move |req: &tokio_tungstenite::tungstenite::handshake::server::Request,
                   resp: tokio_tungstenite::tungstenite::handshake::server::Response| {
@@ -168,8 +183,10 @@ impl WsListener {
                 }
                 Ok(resp)
             },
-        )
-        .await?;
+        );
+        let ws = tokio::time::timeout(WS_UPGRADE_TIMEOUT, upgrade)
+            .await
+            .map_err(|_| NetError::Timeout)??;
         let path_str = path.lock().expect("path lock poisoned").clone();
         debug!("ws accepted from {peer} path={path_str}");
         Ok((ws, peer, path_str))
@@ -180,7 +197,9 @@ impl WsListener {
 pub async fn dial(addr: SocketAddr, path: &str) -> Result<RawClientWs> {
     let url = format!("ws://{addr}{path}");
     debug!("ws dialing {url}");
-    let (ws, _resp) = connect_async(&url).await?;
+    let (ws, _resp) = tokio::time::timeout(WS_UPGRADE_TIMEOUT, connect_async(&url))
+        .await
+        .map_err(|_| NetError::Timeout)??;
     Ok(ws)
 }
 
@@ -219,8 +238,11 @@ where
         .await
         .map_err(|_| NetError::Closed)?;
 
-    // 2. 等对端 Hello
-    let first = in_rx.recv().await.ok_or(NetError::Closed)?;
+    // 2. 等对端 Hello（带超时，防 slowloris：连上却迟迟不发 Hello）
+    let first = tokio::time::timeout(HANDSHAKE_TIMEOUT, in_rx.recv())
+        .await
+        .map_err(|_| NetError::Timeout)?
+        .ok_or(NetError::Closed)?;
     let remote = match first {
         InFrame::Msg(Msg::Hello {
             version,
